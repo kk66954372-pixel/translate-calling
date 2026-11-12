@@ -63,30 +63,37 @@
     <header class="topbar room-bar">
       <button id="leave-btn" class="btn ghost" data-i18n="leave"></button>
       <div class="partner" id="partner-info"></div>
-      <div class="call-btns">
-        <button id="voice-btn" class="btn icon" aria-label="voice call">📞</button>
-        <button id="video-btn" class="btn icon" aria-label="video call">🎥</button>
-      </div>
+      <button id="call-btn" class="btn primary call-btn">📞 <span data-i18n="voiceCall"></span></button>
     </header>
 
     <div class="room-body">
       <div id="stage" class="stage" hidden>
-        <video id="remote-video" autoplay playsinline></video>
-        <div class="avatar-big" id="remote-avatar"></div>
-        <video id="local-video" autoplay playsinline muted></video>
-        <div class="call-status" id="call-status"></div>
-        <div class="captions">
-          <div id="cap-partner-interim" class="cap-interim"></div>
-          <div id="cap-partner" class="cap-main"></div>
-          <div id="cap-partner-orig" class="cap-orig"></div>
-          <div id="cap-me" class="cap-me"></div>
+        <audio id="remote-audio" autoplay></audio>
+        <div class="call-head">
+          <div class="avatar-big" id="remote-avatar"></div>
+          <div>
+            <div class="call-name" id="call-name"></div>
+            <div class="call-status" id="call-status"></div>
+          </div>
         </div>
+
+        <!-- What my partner says: their voice is heard as-is, the translation appears here -->
+        <div class="cap-block partner">
+          <div id="cap-partner" class="cap-main" data-i18n="captionHint"></div>
+          <div id="cap-partner-orig" class="cap-orig"></div>
+          <div id="cap-partner-interim" class="cap-interim"></div>
+        </div>
+
+        <!-- What I say, and how it is shown to my partner -->
+        <div class="cap-block me">
+          <span class="cap-label" data-i18n="you"></span>
+          <span id="cap-me" class="cap-me-text"></span>
+          <span id="cap-me-translated" class="cap-me-tr"></span>
+        </div>
+
         <div class="controls">
           <button id="mic-btn" class="ctl on"><span>🎙️</span><small data-i18n="mic"></small></button>
-          <button id="cam-btn" class="ctl on"><span>📷</span><small data-i18n="camera"></small></button>
-          <button id="tts-btn" class="ctl on"><span>🔊</span><small data-i18n="readAloud"></small></button>
-          <label class="ctl vol"><span>🎚️</span><small data-i18n="originalVolume"></small><input id="vol" type="range" min="0" max="1" step="0.05" value="0.35" /></label>
-          <button id="hangup-btn" class="ctl hangup"><span>⏹</span><small data-i18n="hangup"></small></button>
+          <button id="hangup-btn" class="ctl hangup"><span>📞</span><small data-i18n="hangup"></small></button>
         </div>
       </div>
 

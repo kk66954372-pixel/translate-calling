@@ -14,9 +14,7 @@ const state = {
   translator: "claude",
   matching: false,
   modal: null, // { kind, data }
-  readAloud: load("readAloud", true),
   mic: true,
-  cam: true,
 };
 let T = STRINGS.ko;
 let call = null;
@@ -273,8 +271,7 @@ function partnerGone(text) {
 function setRoomEnabled(on) {
   $("#msg-input").disabled = !on;
   $("#composer button").disabled = !on;
-  $("#voice-btn").disabled = !on;
-  $("#video-btn").disabled = !on;
+  $("#call-btn").disabled = !on;
   $("#typing").hidden = true;
 }
 
@@ -426,44 +423,36 @@ $("#composer").addEventListener("submit", (e) => {
 socket.on("chat:typing", (on) => ($("#typing").hidden = !on));
 
 // ---------------------------------------------------------------------------
-// Room: call + live translated captions
+// Room: voice call + live translated captions
+//   - My real voice goes to my partner over WebRTC (no synthetic voice).
+//   - The browser turns my speech into text, the server translates it,
+//     and my partner sees it on screen in their language.
 // ---------------------------------------------------------------------------
-const remoteVideo = $("#remote-video");
-const localVideo = $("#local-video");
-remoteVideo.volume = Number($("#vol").value);
-
+const remoteAudio = $("#remote-audio");
 let callTimer = null;
 let partnerCapTimer = null;
+let myCapTimer = null;
+let lastMyCaptionId = null;
 
 function setupCall(iceServers) {
   call = new Call(socket, iceServers);
 
-  call.addEventListener("incoming", ({ detail }) => {
+  call.addEventListener("incoming", () => {
     if (!state.partner) return call.decline();
-    openModal("incoming-call", `${detail.video ? "🎥" : "📞"} ${T.incomingCall(state.partner.name, detail.video)}`, [
+    openModal("incoming-call", `📞 ${T.incomingCall(state.partner.name)}`, [
       { label: T.decline, onClick: () => call.decline() },
       { label: T.accept, cls: "primary", onClick: () => call.accept().catch(() => toast(T.mediaError)) },
     ]);
   });
 
-  call.addEventListener("local-stream", ({ detail }) => {
-    localVideo.srcObject = detail.stream;
-    localVideo.hidden = !detail.stream.getVideoTracks().length;
-    openStage();
-  });
+  call.addEventListener("local-stream", () => openStage());
   call.addEventListener("remote-stream", ({ detail }) => {
-    remoteVideo.srcObject = detail.stream;
-    remoteVideo.play().catch(() => {});
-  });
-  call.addEventListener("remote-track", ({ detail }) => {
-    if (detail.track.kind === "video") $("#stage").classList.add("has-remote-video");
+    remoteAudio.srcObject = detail.stream;
+    remoteAudio.play().catch(() => {});
   });
   call.addEventListener("state", ({ detail }) => {
-    if (detail.state === "outgoing") $("#call-status").textContent = T.calling;
-    if (detail.state === "active") {
-      $("#call-status").textContent = T.calling;
-      startRecognition();
-    }
+    $("#call-status").textContent = T.calling;
+    if (detail.state === "active") startRecognition();
   });
   call.addEventListener("connection", ({ detail }) => {
     if (detail.state === "connected") startTimer();
@@ -477,33 +466,37 @@ function setupCall(iceServers) {
   });
 }
 
+function setPartnerCaption(main, orig = "") {
+  const el = $("#cap-partner");
+  el.classList.toggle("hint", !main);
+  el.textContent = main || T.captionHint;
+  $("#cap-partner-orig").textContent = orig;
+}
+
 function openStage() {
-  const stage = $("#stage");
-  stage.hidden = false;
-  stage.classList.remove("has-remote-video");
+  $("#stage").hidden = false;
+  $("#call-btn").hidden = true;
   const av = $("#remote-avatar");
   if (state.partner) {
     av.className = `avatar-big ${state.partner.lang}`;
     av.textContent = [...state.partner.name][0]?.toUpperCase() ?? "?";
+    $("#call-name").textContent = state.partner.name;
   }
-  ["#cap-partner", "#cap-partner-orig", "#cap-partner-interim", "#cap-me"].forEach((s) => ($(s).textContent = ""));
+  setPartnerCaption("");
+  ["#cap-partner-interim", "#cap-me", "#cap-me-translated"].forEach((sel) => ($(sel).textContent = ""));
   state.mic = true;
-  state.cam = true;
   $("#mic-btn").classList.add("on");
-  $("#cam-btn").classList.add("on");
-  $("#cam-btn").hidden = !call.hasLocalVideo;
-  $("#tts-btn").classList.toggle("on", state.readAloud);
 }
 
 function closeStage() {
   $("#stage").hidden = true;
+  $("#call-btn").hidden = false;
   stopRecognition();
   window.speechSynthesis?.cancel();
   clearInterval(callTimer);
   callTimer = null;
   $("#call-status").textContent = "";
-  remoteVideo.srcObject = null;
-  localVideo.srcObject = null;
+  remoteAudio.srcObject = null;
 }
 
 function startTimer() {
@@ -511,11 +504,25 @@ function startTimer() {
   clearInterval(callTimer);
   const tick = () => {
     const s = Math.floor((Date.now() - started) / 1000);
-    const live = recognizer?.running ? ` · 🎙️ ${T.listening}` : "";
-    $("#call-status").textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}${live}`;
+    const mm = String(Math.floor(s / 60)).padStart(2, "0");
+    const ss = String(s % 60).padStart(2, "0");
+    const live = !state.mic ? ` · 🔇 ${T.mutedHint}` : recognizer?.running ? ` · 🎙️ ${T.listening}` : "";
+    $("#call-status").textContent = `${mm}:${ss}${live}`;
   };
   tick();
   callTimer = setInterval(tick, 1000);
+}
+
+function showMyCaption(text, translated = "") {
+  clearTimeout(myCapTimer);
+  $("#cap-me").textContent = text;
+  $("#cap-me-translated").textContent = translated;
+  if (translated) {
+    myCapTimer = setTimeout(() => {
+      $("#cap-me").textContent = "";
+      $("#cap-me-translated").textContent = "";
+    }, 10000);
+  }
 }
 
 function startRecognition() {
@@ -524,9 +531,10 @@ function startRecognition() {
   if (!recognizer) {
     let lastInterim = 0;
     recognizer = new Recognizer(SPEECH_LANG[state.me.lang], {
+      // Ignore the mic while a 🔊 pronunciation sample is playing, or while muted.
       shouldIgnore: () => isSpeaking() || !state.mic,
       onInterim: (text) => {
-        $("#cap-me").textContent = `${T.you}: ${text}`;
+        showMyCaption(text);
         const now = Date.now();
         if (now - lastInterim > 350) {
           lastInterim = now;
@@ -534,17 +542,17 @@ function startRecognition() {
         }
       },
       onFinal: (text) => {
-        $("#cap-me").textContent = "";
+        showMyCaption(text);
         socket.emit("speech:final", { text });
       },
-      onState: (s) => {
-        if (s === "denied") toast(T.speechDenied);
+      onState: (st) => {
+        if (st === "denied") toast(T.speechDenied);
       },
     });
   }
   recognizer.lang = SPEECH_LANG[state.me.lang];
   recognizer.start();
-  if (!load("tipShown", false) && state.readAloud) {
+  if (!load("tipShown", false)) {
     toast(`🎧 ${T.headphoneTip}`, 6000);
     save("tipShown", true);
   }
@@ -553,31 +561,35 @@ function stopRecognition() {
   recognizer?.stop();
 }
 
+// Partner is speaking: show their words live (original language) until the translation arrives.
 socket.on("speech:interim", ({ text }) => {
   $("#cap-partner-interim").textContent = text ? `${text}…` : "";
+  $("#stage").classList.toggle("speaking", Boolean(text));
 });
 
 socket.on("caption", (cap) => {
   renderEntry(cap, "caption");
-  if (cap.from !== state.me.id) $("#cap-partner-interim").textContent = "";
+  if (cap.from === state.me.id) lastMyCaptionId = cap.id;
+  else {
+    $("#cap-partner-interim").textContent = "";
+    $("#stage").classList.remove("speaking");
+  }
 });
 
 socket.on("caption:translation", (t) => {
   const r = applyTranslation(t);
-  if (!r || r.mine || !t.ok) return;
-  // Show the partner's sentence, translated, as a subtitle over the call.
-  $("#cap-partner").textContent = t.text;
-  $("#cap-partner-orig").textContent = r.entry.text;
+  if (!r || !t.ok) return;
+  if (r.mine) {
+    // Let me see how my sentence was shown to my partner (good for learning).
+    if (t.id === lastMyCaptionId) showMyCaption(r.entry.text, t.text);
+    return;
+  }
+  setPartnerCaption(t.text, r.entry.text);
   clearTimeout(partnerCapTimer);
-  partnerCapTimer = setTimeout(() => {
-    $("#cap-partner").textContent = "";
-    $("#cap-partner-orig").textContent = "";
-  }, 9000);
-  if (state.readAloud && call?.state === "active") speak(t.text, SPEECH_LANG[state.me.lang], { rate: 1.05 });
+  partnerCapTimer = setTimeout(() => setPartnerCaption(""), 12000);
 });
 
-$("#voice-btn").addEventListener("click", () => call?.start(false).catch(() => toast(T.mediaError)));
-$("#video-btn").addEventListener("click", () => call?.start(true).catch(() => toast(T.mediaError)));
+$("#call-btn").addEventListener("click", () => call?.start().catch(() => toast(T.mediaError)));
 $("#hangup-btn").addEventListener("click", () => call?.hangup());
 
 $("#mic-btn").addEventListener("click", () => {
@@ -587,21 +599,9 @@ $("#mic-btn").addEventListener("click", () => {
   if (state.mic) startRecognition();
   else {
     stopRecognition();
-    $("#cap-me").textContent = "";
+    showMyCaption("");
   }
 });
-$("#cam-btn").addEventListener("click", () => {
-  state.cam = !state.cam;
-  call?.setCameraEnabled(state.cam);
-  $("#cam-btn").classList.toggle("on", state.cam);
-});
-$("#tts-btn").addEventListener("click", () => {
-  state.readAloud = !state.readAloud;
-  save("readAloud", state.readAloud);
-  $("#tts-btn").classList.toggle("on", state.readAloud);
-  if (!state.readAloud) window.speechSynthesis?.cancel();
-});
-$("#vol").addEventListener("input", (e) => (remoteVideo.volume = Number(e.target.value)));
 
 // Hook for automated tests and debugging (simulates a finished spoken sentence).
 window.__koja = { sendSpeech: (text) => socket.emit("speech:final", { text }), state };

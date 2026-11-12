@@ -1,21 +1,19 @@
-// 1:1 WebRTC call. Media goes peer-to-peer; the server only relays signaling.
+// 1:1 WebRTC voice call. Audio goes peer-to-peer; the server only relays signaling.
 export class Call extends EventTarget {
   constructor(socket, iceServers) {
     super();
     this.socket = socket;
     this.iceServers = iceServers;
     this.state = "idle"; // idle | outgoing | incoming | active
-    this.video = false;
     this.pc = null;
     this.localStream = null;
     this.remoteStream = null;
     this.pendingCandidates = [];
 
-    socket.on("call:request", ({ video }) => {
+    socket.on("call:request", () => {
       if (this.state !== "idle") return socket.emit("call:decline", { reason: "busy" });
       this.state = "incoming";
-      this.video = Boolean(video);
-      this.emit("incoming", { video: this.video });
+      this.emit("incoming");
     });
     socket.on("call:accept", () => this.#onAccepted());
     socket.on("call:decline", () => {
@@ -32,24 +30,23 @@ export class Call extends EventTarget {
     this.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
-  async start(video) {
+  async start() {
     if (this.state !== "idle") return;
     this.state = "outgoing";
-    this.video = video;
     try {
-      await this.#getMedia(video);
+      await this.#getMedia();
     } catch (e) {
       this.#cleanup("media_error");
       throw e;
     }
     this.emit("state", { state: this.state });
-    this.socket.emit("call:request", { video });
+    this.socket.emit("call:request");
   }
 
   async accept() {
     if (this.state !== "incoming") return;
     try {
-      await this.#getMedia(this.video);
+      await this.#getMedia();
     } catch (e) {
       this.socket.emit("call:decline", { reason: "media_error" });
       this.#cleanup("media_error");
@@ -81,22 +78,11 @@ export class Call extends EventTarget {
   setMicEnabled(on) {
     this.localStream?.getAudioTracks().forEach((t) => (t.enabled = on));
   }
-  setCameraEnabled(on) {
-    this.localStream?.getVideoTracks().forEach((t) => (t.enabled = on));
-  }
-  get hasLocalVideo() {
-    return Boolean(this.localStream?.getVideoTracks().length);
-  }
-
-  async #getMedia(video) {
-    const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
-    try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio, video: video ? { width: 1280, height: 720 } : false });
-    } catch (e) {
-      if (!video) throw e;
-      // Camera unavailable: fall back to a voice call instead of failing outright.
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio, video: false });
-    }
+  async #getMedia() {
+    this.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
     this.emit("local-stream", { stream: this.localStream });
   }
 
@@ -109,7 +95,6 @@ export class Call extends EventTarget {
     this.localStream.getTracks().forEach((t) => pc.addTrack(t, this.localStream));
     pc.ontrack = (ev) => {
       if (!this.remoteStream.getTracks().includes(ev.track)) this.remoteStream.addTrack(ev.track);
-      this.emit("remote-track", { track: ev.track });
     };
     pc.onicecandidate = (ev) => {
       if (ev.candidate) this.socket.emit("rtc:signal", { type: "candidate", candidate: ev.candidate });
