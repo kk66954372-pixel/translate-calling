@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>KoJa Talk · 코자톡 · コジャトーク</title>
+  <meta name="description" content="한국어 ↔ 日本語 실시간 번역 채팅 & 통화 언어교환" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <!-- 1. Profile setup -------------------------------------------------------->
+  <section id="screen-setup" class="screen active">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="logo">💬</span>
+        <h1>KoJa Talk</h1>
+        <p class="brand-sub">코자톡 · コジャトーク</p>
+      </div>
+      <p class="tagline">말하면 바로 번역돼요. 일본 친구와 채팅하고 통화하세요.<br />話すとすぐに翻訳。韓国の友達とチャットや通話をしよう。</p>
+      <form id="setup-form" autocomplete="off">
+        <label class="field">
+          <span>닉네임 · ニックネーム</span>
+          <input id="nickname" maxlength="24" required placeholder="민수 / ゆうき" />
+        </label>
+        <fieldset class="field">
+          <legend>내 모국어 · 母国語</legend>
+          <div class="lang-pick">
+            <label class="lang-tile"><input type="radio" name="lang" value="ko" checked /><span><b>🇰🇷 한국어</b><small>일본어로 번역돼요</small></span></label>
+            <label class="lang-tile"><input type="radio" name="lang" value="ja" /><span><b>🇯🇵 日本語</b><small>韓国語に翻訳されます</small></span></label>
+          </div>
+        </fieldset>
+        <button class="btn primary big" type="submit">시작하기 · はじめる</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- 2. Lobby ---------------------------------------------------------------->
+  <section id="screen-lobby" class="screen">
+    <header class="topbar">
+      <div class="brand-mini"><span class="logo">💬</span> KoJa Talk</div>
+      <div class="me-chip" id="me-chip"></div>
+    </header>
+    <div id="mock-banner" class="banner" hidden data-i18n="mockMode"></div>
+    <main class="lobby">
+      <div class="card match-card">
+        <div>
+          <h2 data-i18n="randomTitle"></h2>
+          <p class="muted" data-i18n="randomDesc"></p>
+        </div>
+        <button id="match-btn" class="btn primary" data-i18n="findPartner"></button>
+      </div>
+      <div class="card">
+        <h2><span data-i18n="online"></span> <span id="online-count" class="count"></span></h2>
+        <ul id="user-list" class="user-list"></ul>
+        <p id="nobody" class="muted empty" data-i18n="nobody"></p>
+      </div>
+    </main>
+  </section>
+
+  <!-- 3. Room: chat + call ------------------------------------------------------>
+  <section id="screen-room" class="screen">
+    <header class="topbar room-bar">
+      <button id="leave-btn" class="btn ghost" data-i18n="leave"></button>
+      <div class="partner" id="partner-info"></div>
+      <div class="call-btns">
+        <button id="voice-btn" class="btn icon" aria-label="voice call">📞</button>
+        <button id="video-btn" class="btn icon" aria-label="video call">🎥</button>
+      </div>
+    </header>
+
+    <div class="room-body">
+      <div id="stage" class="stage" hidden>
+        <video id="remote-video" autoplay playsinline></video>
+        <div class="avatar-big" id="remote-avatar"></div>
+        <video id="local-video" autoplay playsinline muted></video>
+        <div class="call-status" id="call-status"></div>
+        <div class="captions">
+          <div id="cap-partner-interim" class="cap-interim"></div>
+          <div id="cap-partner" class="cap-main"></div>
+          <div id="cap-partner-orig" class="cap-orig"></div>
+          <div id="cap-me" class="cap-me"></div>
+        </div>
+        <div class="controls">
+          <button id="mic-btn" class="ctl on"><span>🎙️</span><small data-i18n="mic"></small></button>
+          <button id="cam-btn" class="ctl on"><span>📷</span><small data-i18n="camera"></small></button>
+          <button id="tts-btn" class="ctl on"><span>🔊</span><small data-i18n="readAloud"></small></button>
+          <label class="ctl vol"><span>🎚️</span><small data-i18n="originalVolume"></small><input id="vol" type="range" min="0" max="1" step="0.05" value="0.35" /></label>
+          <button id="hangup-btn" class="ctl hangup"><span>⏹</span><small data-i18n="hangup"></small></button>
+        </div>
+      </div>
+
+      <div class="chat">
+        <ul id="messages" class="messages"></ul>
+        <div id="typing" class="typing" hidden data-i18n="typing"></div>
+        <form id="composer" class="composer" autocomplete="off">
+          <textarea id="msg-input" rows="1" maxlength="1000"></textarea>
+          <button class="btn primary" type="submit" data-i18n="send"></button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- Modal & toast -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <p id="modal-text"></p>
+      <div id="modal-actions" class="modal-actions"></div>
+    </div>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

@@ -1,1 +1,75 @@
-# translate-calling
+# KoJa Talk · 코자톡 · コジャトーク
+
+한국인과 일본인이 **실시간 번역 채팅**과 **번역 자막이 나오는 음성/영상 통화**로 대화하는 언어교환 웹앱입니다.
+
+韓国人と日本人が、**リアルタイム翻訳チャット**と**翻訳字幕つきの音声・ビデオ通話**で会話できるランゲージエクスチェンジWebアプリです。
+
+## 기능
+
+| 기능 | 설명 |
+|---|---|
+| 프로필 | 닉네임 + 모국어(한국어/日本語) 선택. UI가 내 언어로 표시됩니다. |
+| 로비 | 접속 중인 사용자 목록, 대화 신청/수락, **랜덤 매칭**(한↔일 자동 연결) |
+| 번역 채팅 | 보낸 메시지가 즉시 상대 언어로 번역. 받은 메시지는 **번역문 + 원문**을 함께 보여 줘서 공부가 됩니다. 내 메시지에는 "상대에게 보이는 문장"이 표시됩니다. |
+| 🔊 발음 듣기 | 원문/번역문 옆 버튼으로 원어 발음을 TTS로 들을 수 있습니다. |
+| 음성·영상 통화 | WebRTC P2P 통화. 마이크/카메라 on/off |
+| 실시간 통화 번역 | 말하면 브라우저 음성 인식 → 서버에서 번역 → 상대 화면에 **번역 자막**, 원하면 **번역 음성 읽어주기**. 원음 볼륨을 따로 조절할 수 있습니다. |
+| 통화 기록 | 통화 중 문장도 채팅창에 원문+번역으로 남아 나중에 복습할 수 있습니다. |
+
+번역은 Claude API(`claude-opus-5-5`)를 사용합니다. 최근 대화 몇 줄을 문맥으로 함께 보내서 생략된 주어, 반말/존댓말·タメ口/敬語 같은 말투를 유지하도록 했습니다.
+
+## 실행하기
+
+Node.js 20 이상이 필요합니다.
+
+```bash
+npm install
+
+# 실제 번역 (Claude API 키 필요)
+export ANTHROPIC_API_KEY=sk-ant-...
+npm start
+
+# API 키 없이 UI만 테스트 (번역 대신 "[ko→ja] 원문" 형태로 표시)
+npm run dev:mock
+```
+
+브라우저에서 `http://localhost:3000` 을 연 뒤, 다른 브라우저 창(또는 시크릿 창)에서 하나 더 열어 한국어/일본어 사용자로 각각 접속해 보세요.
+
+### 환경 변수
+
+| 이름 | 기본값 | 설명 |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | – | Claude API 키 |
+| `TRANSLATOR` | `claude` | `mock` 으로 두면 API 호출 없이 동작 |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | 번역에 쓸 모델 |
+| `PORT` | `3000` | 서버 포트 |
+| `ICE_SERVERS` | Google STUN | WebRTC ICE 서버 JSON. 예: `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |
+
+## 구조
+
+```
+src/server.js       Express + Socket.IO: 로비, 매칭, 채팅, 통화 시그널링, 번역 호출
+src/translator.js   Claude API 번역 (문맥 포함, 짧은 문구 캐시, mock 모드)
+public/index.html   단일 페이지 (설정 → 로비 → 대화방)
+public/js/app.js    화면/채팅/통화 UI 로직
+public/js/rtc.js    WebRTC 1:1 통화 (offer/answer/ICE)
+public/js/speech.js 음성 인식(Web Speech API) + TTS
+public/js/i18n.js   한국어/일본어 UI 문자열
+```
+
+통화 번역 흐름:
+
+```
+[내 마이크] → 브라우저 음성인식(ko-KR/ja-JP) → socket "speech:final"
+   → 서버: Claude 번역 → socket "caption:translation" → [상대 화면 자막 + TTS]
+[음성/영상 자체]는 WebRTC로 상대와 직접(P2P) 연결
+```
+
+## 알아둘 점
+
+- **음성 인식은 Chrome / Edge 권장**입니다 (Web Speech API). Firefox는 통화·채팅은 되지만 통화 자막이 꺼집니다.
+- 마이크/카메라는 **HTTPS 또는 localhost**에서만 동작합니다. 배포 시 HTTPS가 필요합니다.
+- 번역 음성 읽어주기를 켤 때는 **이어폰 사용을 권장**합니다. (스피커 소리가 다시 인식되는 것을 막기 위해 읽는 동안은 인식 결과를 무시하지만, 이어폰이 가장 정확합니다.)
+- 서로 다른 네트워크(특히 모바일 데이터, 회사망) 간 통화는 STUN만으로 연결이 안 될 수 있어 **TURN 서버**(`ICE_SERVERS`)가 필요합니다.
+- 상태(접속자, 대화방)는 서버 메모리에만 저장됩니다. 회원가입/DB/신고 기능은 아직 없습니다.
+- WebSocket을 쓰므로 Vercel 같은 서버리스보다는 Render, Fly.io, Railway 같은 상시 실행 서버에 배포하세요.

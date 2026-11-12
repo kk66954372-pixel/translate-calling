@@ -1,0 +1,29 @@
+{
+  "name": "koja-talk",
+  "version": "1.0.0",
+  "description": "Korean ↔ Japanese language exchange: real-time translated chat and calls",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "dev:mock": "TRANSLATOR=mock node --watch src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kk66954372-pixel/translate-calling.git"
+  },
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kk66954372-pixel/translate-calling/issues"
+  },
+  "homepage": "https://github.com/kk66954372-pixel/translate-calling#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
+    "express": "^4.22.3",
+    "socket.io": "^4.8.4"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
