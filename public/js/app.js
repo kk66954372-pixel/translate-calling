@@ -112,6 +112,26 @@ if (saved) {
   if (radio) radio.checked = true;
 }
 
+// Opened from an invite link (/?room=CODE): greet the friend and preselect their language.
+let pendingJoin = new URLSearchParams(location.search).get("room");
+if (pendingJoin) {
+  fetch(`/api/link/${encodeURIComponent(pendingJoin)}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then((info) => {
+      const banner = $("#invite-banner");
+      if (info?.ok) {
+        const { name, lang } = info.host;
+        banner.textContent = `💌 ${name}님이 초대했어요 · ${name}さんから招待が届きました`;
+        const radio = document.querySelector(`input[name=lang][value="${lang === "ko" ? "ja" : "ko"}"]`);
+        if (radio) radio.checked = true;
+      } else {
+        banner.textContent = `⚠️ ${STRINGS.ko.linkExpired} / ${STRINGS.ja.linkExpired}`;
+      }
+      banner.hidden = false;
+    });
+}
+
 const configPromise = fetch("/api/config")
   .then((r) => r.json())
   .catch(() => ({ translator: "claude", iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
@@ -137,6 +157,18 @@ function setProfile(name, lang) {
     renderMe();
     $("#mock-banner").hidden = state.translator !== "mock";
     if (!state.roomOpen) show("lobby");
+    if (pendingJoin) joinByLink();
+    else if (linkCode && !state.roomOpen) createLink(linkCode);
+  });
+}
+
+function joinByLink() {
+  const code = pendingJoin;
+  pendingJoin = null;
+  history.replaceState(null, "", location.pathname);
+  socket.emit("link:join", { code }, (res) => {
+    if (res?.ok) return;
+    toast(res?.error === "self" ? T.linkSelf : res?.error === "busy" ? T.partnerBusy : T.linkExpired, 5000);
   });
 }
 
@@ -222,6 +254,43 @@ socket.on("invite:declined", ({ reason }) => {
   toast(reason === "busy" ? T.partnerBusy : T.declined);
 });
 
+// ---- Invite link ---------------------------------------------------------------
+let linkCode = null;
+const linkUrl = (code) => `${location.origin}${location.pathname}?room=${code}`;
+
+function createLink(code) {
+  socket.emit("link:create", code ? { code } : {}, (res) => {
+    if (!res?.ok) return;
+    linkCode = res.code;
+    $("#link-url").value = linkUrl(linkCode);
+    $("#link-box").hidden = false;
+    $("#link-btn").hidden = true;
+  });
+}
+function resetLink() {
+  linkCode = null;
+  $("#link-box").hidden = true;
+  $("#link-btn").hidden = false;
+}
+
+$("#link-btn").addEventListener("click", () => createLink());
+$("#copy-btn").addEventListener("click", async () => {
+  const url = $("#link-url").value;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    $("#link-url").select();
+    document.execCommand("copy");
+  }
+  toast(T.copied);
+});
+if (navigator.share) {
+  $("#share-btn").hidden = false;
+  $("#share-btn").addEventListener("click", () =>
+    navigator.share({ title: "KoJa Talk", text: T.shareText, url: $("#link-url").value }).catch(() => {}),
+  );
+}
+
 $("#match-btn").addEventListener("click", () => {
   if (state.matching) return setMatching(false, true);
   setMatching(true);
@@ -243,6 +312,7 @@ function setMatching(on, notify = false) {
 socket.on("room:joined", ({ partner }) => {
   closeModal();
   setMatching(false);
+  resetLink();
   state.partner = partner;
   state.roomOpen = true;
   messageEls.clear();

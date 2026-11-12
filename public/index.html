@@ -18,6 +18,7 @@
         <p class="brand-sub">코자톡 · コジャトーク</p>
       </div>
       <p class="tagline">말하면 바로 번역돼요. 일본 친구와 채팅하고 통화하세요.<br />話すとすぐに翻訳。韓国の友達とチャットや通話をしよう。</p>
+      <div id="invite-banner" class="invite-banner" hidden></div>
       <form id="setup-form" autocomplete="off">
         <label class="field">
           <span>닉네임 · ニックネーム</span>
@@ -43,6 +44,19 @@
     </header>
     <div id="mock-banner" class="banner" hidden data-i18n="mockMode"></div>
     <main class="lobby">
+      <div class="card invite-card">
+        <h2 data-i18n="inviteTitle"></h2>
+        <p class="muted" data-i18n="inviteDesc"></p>
+        <button id="link-btn" class="btn primary" data-i18n="makeLink"></button>
+        <div id="link-box" class="link-box" hidden>
+          <input id="link-url" readonly />
+          <div class="link-actions">
+            <button id="copy-btn" class="btn primary" data-i18n="copy"></button>
+            <button id="share-btn" class="btn" data-i18n="share" hidden></button>
+          </div>
+          <p class="muted small" data-i18n="linkWaiting"></p>
+        </div>
+      </div>
       <div class="card match-card">
         <div>
           <h2 data-i18n="randomTitle"></h2>

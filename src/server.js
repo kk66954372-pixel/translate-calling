@@ -1,7 +1,7 @@
 import express from "express";
 import http from "node:http";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomInt } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import { translate, translatorInfo, LANGS } from "./translator.js";
@@ -31,6 +31,13 @@ app.get("/api/config", (_req, res) => {
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
+// Lets the invite page greet the friend ("민수 invited you") and preselect their language.
+app.get("/api/link/:code", (req, res) => {
+  const host = users.get(links.get(String(req.params.code).toLowerCase()));
+  if (!host) return res.status(404).json({ ok: false });
+  res.json({ ok: true, host: { name: host.name, lang: host.lang } });
+});
+
 // ---------------------------------------------------------------------------
 // In-memory state (single server instance). Swap for Redis/DB when scaling out.
 // ---------------------------------------------------------------------------
@@ -40,6 +47,18 @@ const users = new Map();
 const rooms = new Map();
 /** pending invites: inviterId -> targetId */
 const invites = new Map();
+/** invite links: code -> hostId (a friend who opens /?room=CODE joins the host directly) */
+const links = new Map();
+const LINK_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+function newLinkCode() {
+  let code;
+  do code = Array.from({ length: 6 }, () => LINK_ALPHABET[randomInt(LINK_ALPHABET.length)]).join("");
+  while (links.has(code));
+  return code;
+}
+function dropLinksOf(hostId) {
+  for (const [code, host] of links) if (host === hostId) links.delete(code);
+}
 const HISTORY_LINES = 6;
 
 const publicUser = (u) => ({ id: u.id, name: u.name, lang: u.lang, busy: Boolean(u.roomId) });
@@ -181,6 +200,36 @@ io.on("connection", (socket) => {
     if (me) me.matching = false;
   });
 
+  // ---- Invite links ---------------------------------------------------------
+  socket.on("link:create", ({ code: wanted } = {}, ack) => {
+    const me = users.get(socket.id);
+    if (!me) return ack?.({ ok: false });
+    let code = [...links].find(([, host]) => host === me.id)?.[0];
+    if (!code) {
+      // After a reconnect the host asks for their previous code back, so the link they already sent keeps working.
+      const reuse = typeof wanted === "string" && /^[a-z0-9]{6}$/.test(wanted) && !links.has(wanted);
+      code = reuse ? wanted : newLinkCode();
+      links.set(code, me.id);
+    }
+    ack?.({ ok: true, code });
+  });
+
+  socket.on("link:cancel", () => dropLinksOf(socket.id));
+
+  socket.on("link:join", ({ code } = {}, ack) => {
+    const me = users.get(socket.id);
+    const key = String(code ?? "").toLowerCase();
+    const hostId = links.get(key);
+    const host = users.get(hostId);
+    if (!me) return ack?.({ ok: false, error: "no_profile" });
+    if (!host) return ack?.({ ok: false, error: "expired" });
+    if (host.id === me.id) return ack?.({ ok: false, error: "self" });
+    if (host.roomId || me.roomId) return ack?.({ ok: false, error: "busy" });
+    links.delete(key);
+    createRoom(host.id, me.id);
+    ack?.({ ok: true });
+  });
+
   socket.on("room:leave", () => leaveRoom(socket.id, "left"));
 
   // ---- Chat ----------------------------------------------------------------
@@ -243,6 +292,7 @@ io.on("connection", (socket) => {
     const targetId = invites.get(socket.id);
     if (targetId) io.to(targetId).emit("invite:cancelled", { from: socket.id });
     invites.delete(socket.id);
+    dropLinksOf(socket.id);
     users.delete(socket.id);
     broadcastUsers();
   });
