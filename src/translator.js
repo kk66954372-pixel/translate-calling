@@ -11,6 +11,18 @@ export const LANGS = {
 const MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
 const MODE = (process.env.TRANSLATOR || "claude").toLowerCase();
 const MAX_INPUT_CHARS = 1000;
+// Cost guard: at most this many API calls per day (Korea/Japan date). 0 = unlimited.
+const DAILY_LIMIT = Number(process.env.DAILY_TRANSLATION_LIMIT ?? 2000);
+
+const usage = { day: "", count: 0, warned: false };
+const today = () => new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10); // UTC+9
+function takeDailyQuota() {
+  const d = today();
+  if (usage.day !== d) Object.assign(usage, { day: d, count: 0, warned: false });
+  if (DAILY_LIMIT > 0 && usage.count >= DAILY_LIMIT) return false;
+  usage.count++;
+  return true;
+}
 
 const SYSTEM_PROMPT = `You are a real-time interpreter inside a Korean–Japanese language exchange app.
 Two people are chatting or talking on a call; each speaks their native language and reads your translation.
@@ -76,6 +88,12 @@ export async function translate(text, from, to, context = []) {
     return { text: out, ok: true };
   }
 
+  if (!takeDailyQuota()) {
+    if (!usage.warned) console.warn(`[translate] daily limit of ${DAILY_LIMIT} reached`);
+    usage.warned = true;
+    return { text: "", ok: false, error: "daily_limit" };
+  }
+
   const contextBlock = context.length
     ? `<context>\n${context.map((c) => `${escapeXml(c.speaker)}: ${escapeXml(c.text)}`).join("\n")}\n</context>\n\n`
     : "";
@@ -124,4 +142,4 @@ export async function translate(text, from, to, context = []) {
   }
 }
 
-export const translatorInfo = { mode: MODE, model: MODE === "mock" ? null : MODEL };
+export const translatorInfo = { mode: MODE, model: MODE === "mock" ? null : MODEL, dailyLimit: DAILY_LIMIT, usage };

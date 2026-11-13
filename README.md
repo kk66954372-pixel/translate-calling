@@ -9,7 +9,9 @@
 | 기능 | 설명 |
 |---|---|
 | 프로필 | 닉네임 + 모국어(한국어/日本語) 선택. UI가 내 언어로 표시됩니다. |
-| 초대 링크 | 로비에서 "초대 링크 만들기" → 카톡/LINE으로 친구에게 전송 → 친구가 열면 바로 둘만의 방으로 연결. 친구 화면에는 "○○さんから招待が届きました"가 뜨고 일본어가 미리 선택됩니다. (1회용, 내가 접속해 있는 동안 유효) |
+| 고정 방 링크 | 로비에서 "초대 링크 만들기" → 카톡/LINE으로 친구에게 전송. **같은 링크를 계속 사용**합니다. 먼저 들어온 사람이 기다리고, 나중에 들어온 사람과 바로 연결됩니다. 친구 화면에는 "○○さんが待っています"가 뜨고 일본어가 미리 선택됩니다. |
+| 외부 브라우저 열기 | 카톡·LINE·인스타 앱 안에서 링크를 열면 Chrome/Safari로 자동으로 넘기고, 안 되면 방법을 안내합니다 (앱 내 브라우저는 마이크가 막히는 경우가 많음). |
+| 재접속 유지 | 휴대폰 신호가 잠깐 끊기거나 서버가 재시작돼도 60초 동안 방과 통화를 유지하고, 다시 연결되면 그대로 이어집니다. 통화 중 와이파이↔LTE가 바뀌면 통화를 자동 복구합니다. |
 | 로비 | 접속 중인 사용자 목록, 대화 신청/수락, **랜덤 매칭**(한↔일 자동 연결) |
 | 번역 채팅 | 보낸 메시지가 즉시 상대 언어로 번역. 받은 메시지는 **번역문 + 원문**을 함께 보여 줘서 공부가 됩니다. 내 메시지에는 "상대에게 보이는 문장"이 표시됩니다. |
 | 🔊 발음 듣기 | 원문/번역문 옆 버튼으로 원어 발음을 TTS로 들을 수 있습니다. |
@@ -45,7 +47,10 @@ npm run dev:mock
 | `TRANSLATOR` | `claude` | `mock` 으로 두면 API 호출 없이 동작 |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | 번역에 쓸 모델 |
 | `PORT` | `3000` | 서버 포트 |
-| `ICE_SERVERS` | Google STUN | WebRTC ICE 서버 JSON (다른 네트워크 간 통화용 TURN). 예: `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |
+| `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` | – | Cloudflare TURN 키. 있으면 통화마다 임시 TURN 자격증명을 발급합니다 (월 1,000GB 무료). **모바일 데이터·다른 나라 간 통화에 권장** |
+| `ICE_SERVERS` | Google STUN | 다른 TURN 서비스를 쓸 때 ICE 서버 JSON. 예: `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |
+| `DAILY_TRANSLATION_LIMIT` | `2000` | 하루(한국/일본 날짜 기준) 최대 번역 API 호출 수. `0`이면 무제한 |
+| `RECONNECT_GRACE_MS` | `60000` | 연결이 끊긴 사용자의 방을 유지하는 시간 |
 
 ## Render에 배포하기
 
@@ -59,12 +64,15 @@ npm run dev:mock
 
 ```
 src/server.js       Express + Socket.IO: 로비, 매칭, 채팅, 통화 시그널링, 번역 호출
-src/translator.js   Claude API 번역 (문맥 포함, 짧은 문구 캐시, mock 모드)
+src/translator.js   Claude API 번역 (문맥 포함, 짧은 문구 캐시, 하루 한도, mock 모드)
+src/ice.js          WebRTC ICE/TURN 서버 설정 (Cloudflare TURN 임시 자격증명)
 public/index.html   단일 페이지 (설정 → 로비 → 대화방)
 public/js/app.js    화면/채팅/통화 UI 로직
 public/js/rtc.js    WebRTC 1:1 음성 통화 (offer/answer/ICE)
 public/js/speech.js 음성 인식(Web Speech API) + 🔊 발음 듣기용 TTS
 public/js/i18n.js   한국어/일본어 UI 문자열
+public/js/inapp.js  카톡/LINE 등 앱 내 브라우저 감지 → 외부 브라우저로 열기
+docs/PLAN.md        완성 계획과 체크리스트
 ```
 
 통화 번역 흐름:
@@ -80,6 +88,6 @@ public/js/i18n.js   한국어/일본어 UI 문자열
 - **음성 인식은 PC의 Chrome / Edge 권장**입니다 (Web Speech API). Firefox는 통화·채팅은 되지만 통화 자막이 꺼집니다. 모바일 브라우저는 통화와 음성 인식을 동시에 하면 불안정할 수 있습니다.
 - 마이크는 **HTTPS 또는 localhost**에서만 동작합니다. 배포 시 HTTPS가 필요합니다.
 - **이어폰 사용을 권장**합니다. 스피커로 나온 상대 목소리를 내 마이크가 다시 듣게 되면, 그 소리가 내 자막으로 잘못 인식될 수 있습니다.
-- 서로 다른 네트워크(특히 모바일 데이터, 회사망) 간 통화는 STUN만으로 연결이 안 될 수 있어 **TURN 서버**(`ICE_SERVERS`)가 필요합니다.
+- 서로 다른 네트워크(특히 모바일 데이터, 회사망) 간 통화는 STUN만으로 연결이 안 될 수 있어 **TURN 서버**(`CF_TURN_KEY_ID`/`CF_TURN_API_TOKEN` 또는 `ICE_SERVERS`)가 필요합니다.
 - 상태(접속자, 대화방)는 서버 메모리에만 저장됩니다. 회원가입/DB/신고 기능은 아직 없습니다.
 - WebSocket을 쓰므로 Vercel 같은 서버리스보다는 Render, Fly.io, Railway 같은 상시 실행 서버에 배포하세요.

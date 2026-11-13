@@ -1,3 +1,4 @@
+import "./inapp.js";
 import { STRINGS, SPEECH_LANG, FLAG } from "./i18n.js";
 import { Call } from "./rtc.js";
 import { Recognizer, speechSupported, speak, isSpeaking } from "./speech.js";
@@ -15,6 +16,8 @@ const state = {
   matching: false,
   modal: null, // { kind, data }
   mic: true,
+  roomCode: null, // code of the room link the current room came from (if any)
+  waiting: false, // waiting in my room link for my friend
 };
 let T = STRINGS.ko;
 let call = null;
@@ -34,6 +37,18 @@ function save(key, value) {
     localStorage.setItem(`koja:${key}`, JSON.stringify(value));
   } catch {}
 }
+
+// A private id for this browser tab. After a dropped connection the server uses it to give us our
+// room back. sessionStorage (not localStorage) so two tabs in the same browser stay two different users.
+const cid = (() => {
+  try {
+    let v = sessionStorage.getItem("koja:cid");
+    if (!v) sessionStorage.setItem("koja:cid", (v = crypto.randomUUID()));
+    return v;
+  } catch {
+    return crypto.randomUUID();
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -120,11 +135,13 @@ if (pendingJoin) {
     .catch(() => null)
     .then((info) => {
       const banner = $("#invite-banner");
-      if (info?.ok) {
+      if (info?.host) {
         const { name, lang } = info.host;
-        banner.textContent = `💌 ${name}님이 초대했어요 · ${name}さんから招待が届きました`;
+        banner.textContent = `💌 ${name}님이 기다리고 있어요 · ${name}さんが待っています`;
         const radio = document.querySelector(`input[name=lang][value="${lang === "ko" ? "ja" : "ko"}"]`);
         if (radio) radio.checked = true;
+      } else if (info?.ok) {
+        banner.textContent = "💌 초대 링크로 들어왔어요. 친구가 들어오면 바로 연결돼요 · 招待リンクから入りました。友達が来るとすぐにつながります";
       } else {
         banner.textContent = `⚠️ ${STRINGS.ko.linkExpired} / ${STRINGS.ja.linkExpired}`;
       }
@@ -132,9 +149,11 @@ if (pendingJoin) {
     });
 }
 
-const configPromise = fetch("/api/config")
-  .then((r) => r.json())
-  .catch(() => ({ translator: "claude", iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
+// Fetched again for every call so short-lived TURN credentials are always fresh.
+const getIceServers = () =>
+  fetch("/api/config")
+    .then((r) => r.json())
+    .then((c) => c.iceServers);
 
 $("#setup-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -145,40 +164,63 @@ $("#setup-form").addEventListener("submit", (e) => {
 });
 
 function setProfile(name, lang) {
-  socket.emit("profile:set", { name, lang }, async (res) => {
+  socket.emit("profile:set", { name, lang, cid }, (res) => {
     if (!res?.ok) return toast("⚠️");
-    const config = await configPromise;
+    const reconnect = Boolean(state.me);
     state.me = res.me;
     state.translator = res.translator;
     T = STRINGS[lang];
     save("profile", { name, lang });
-    if (!call) setupCall(config.iceServers);
+    if (!call) setupCall();
     applyI18n();
     renderMe();
+    renderLink();
     $("#mock-banner").hidden = state.translator !== "mock";
-    if (!state.roomOpen) show("lobby");
+    if (reconnect) setOffline(false);
+
+    if (res.room) {
+      // The server kept our seat while we were gone: carry on where we left off.
+      if (state.roomOpen) resumeRoom(res.room);
+      else enterRoom(res.room);
+    } else if (state.roomOpen && state.partner) {
+      lostRoom();
+    } else if (!state.roomOpen) {
+      show("lobby");
+    }
+
     if (pendingJoin) joinByLink();
-    else if (linkCode && !state.roomOpen) createLink(linkCode);
+    else if (state.waiting && !res.waitingCode && !state.roomOpen) createLink(); // e.g. the server restarted
   });
 }
 
 function joinByLink() {
-  const code = pendingJoin;
+  const code = pendingJoin.toLowerCase();
   pendingJoin = null;
   history.replaceState(null, "", location.pathname);
   socket.emit("link:join", { code }, (res) => {
-    if (res?.ok) return;
-    toast(res?.error === "self" ? T.linkSelf : res?.error === "busy" ? T.partnerBusy : T.linkExpired, 5000);
+    if (!res?.ok) return toast(res?.error === "busy" ? T.partnerBusy : T.linkExpired, 5000);
+    // The friend's link becomes "our room" on this device too, so either of us can open it next time.
+    save("roomCode", res.code);
+    setWaiting(res.waiting);
   });
 }
 
 socket.on("connect", () => {
-  // Re-register after a reconnect (the server forgets us when the socket drops).
+  // Re-register after a reconnect. The server recognises our cid and gives us our room back.
   if (state.me) setProfile(state.me.name, state.me.lang);
 });
 socket.on("disconnect", () => {
-  if (state.roomOpen && state.partner) partnerGone(T.partnerLeft);
+  if (state.me) setOffline(true);
 });
+
+let offlineTimer = null;
+function setOffline(on) {
+  clearTimeout(offlineTimer);
+  document.body.classList.toggle("offline", on);
+  // Short blips are common on phones: only say something if it lasts.
+  if (on) offlineTimer = setTimeout(() => toast(`📶 ${T.disconnected}`, 60000), 1500);
+  else if ($("#toast").textContent.includes(T.disconnected)) toast(`✅ ${T.reconnected}`);
+}
 
 // ---------------------------------------------------------------------------
 // Lobby
@@ -254,26 +296,42 @@ socket.on("invite:declined", ({ reason }) => {
   toast(reason === "busy" ? T.partnerBusy : T.declined);
 });
 
-// ---- Invite link ---------------------------------------------------------------
-let linkCode = null;
-const linkUrl = (code) => `${location.origin}${location.pathname}?room=${code}`;
+// ---- Room link ------------------------------------------------------------------
+// One permanent link per pair of friends. Whoever opens it first waits; the second person is connected.
+// openExternalBrowser=1 makes LINE open the link in Safari/Chrome instead of its in-app browser.
+const linkUrl = (code) => `${location.origin}${location.pathname}?room=${code}&openExternalBrowser=1`;
 
-function createLink(code) {
-  socket.emit("link:create", code ? { code } : {}, (res) => {
-    if (!res?.ok) return;
-    linkCode = res.code;
-    $("#link-url").value = linkUrl(linkCode);
-    $("#link-box").hidden = false;
-    $("#link-btn").hidden = true;
+function createLink() {
+  socket.emit("link:create", { code: load("roomCode", null) }, (res) => {
+    if (!res?.ok) return toast(res?.error === "busy" ? T.partnerBusy : "⚠️");
+    save("roomCode", res.code);
+    setWaiting(res.waiting);
   });
 }
-function resetLink() {
-  linkCode = null;
-  $("#link-box").hidden = true;
-  $("#link-btn").hidden = false;
+
+function setWaiting(on) {
+  state.waiting = Boolean(on);
+  renderLink();
+}
+
+function renderLink() {
+  const code = load("roomCode", null);
+  $("#link-btn").hidden = Boolean(code);
+  $("#link-box").hidden = !code;
+  if (!code) return;
+  $("#link-url").value = linkUrl(code);
+  $(".invite-card").classList.toggle("waiting", state.waiting);
+  $("#link-status").textContent = state.waiting ? T.linkWaiting : T.linkIdle;
+  $("#wait-btn").textContent = state.waiting ? T.stopWaiting : T.enterRoom;
+  $("#wait-btn").classList.toggle("primary", !state.waiting);
 }
 
 $("#link-btn").addEventListener("click", () => createLink());
+$("#wait-btn").addEventListener("click", () => {
+  if (!state.waiting) return createLink();
+  socket.emit("link:cancel");
+  setWaiting(false);
+});
 $("#copy-btn").addEventListener("click", async () => {
   const url = $("#link-url").value;
   try {
@@ -309,33 +367,89 @@ function setMatching(on, notify = false) {
 // ---------------------------------------------------------------------------
 // Room: chat
 // ---------------------------------------------------------------------------
-socket.on("room:joined", ({ partner }) => {
+socket.on("room:joined", (room) => enterRoom(room));
+
+let repairTimer = null;
+
+function enterRoom({ code, partner }) {
   closeModal();
   setMatching(false);
-  resetLink();
+  setWaiting(false);
+  // Same friend again on the same room link right after losing the room (e.g. the server restarted):
+  // keep the conversation and the call going instead of starting over.
+  const repairing = Boolean(repairTimer) && state.roomOpen && state.lastPartner?.name === partner.name;
+  clearTimeout(repairTimer);
+  repairTimer = null;
   state.partner = partner;
+  state.lastPartner = partner;
   state.roomOpen = true;
+  state.roomCode = code ?? null;
+  renderPartner(partner, true);
+  setRoomEnabled(true);
+  if (repairing) {
+    systemMessage(`✅ ${T.reconnected}`);
+    call?.recover();
+    return;
+  }
+  call?.abort();
   messageEls.clear();
   $("#messages").replaceChildren();
+  systemMessage(T.roomStart(partner.name));
+  show("room");
+  $("#msg-input").focus();
+}
+
+/** We reconnected and the server still had our room. */
+function resumeRoom({ code, partner }) {
+  state.partner = partner;
+  state.roomCode = code ?? null;
+  renderPartner(partner, true);
+  setRoomEnabled(true);
+  call?.recover();
+}
+
+/** We reconnected but the server no longer knows our room (it restarted, or we were gone too long). */
+function lostRoom() {
+  if (!state.roomCode) return partnerGone(T.partnerLeft);
+  // Both of us will come back to the same room link: wait there for a while before giving up.
+  renderPartner(state.partner, false);
+  clearTimeout(repairTimer);
+  repairTimer = setTimeout(() => {
+    repairTimer = null;
+    partnerGone(T.partnerLeft);
+  }, 30_000);
+  socket.emit("link:join", { code: state.roomCode }, (res) => {
+    if (!res?.ok) partnerGone(T.partnerLeft);
+  });
+}
+
+function renderPartner(partner, online) {
   const info = $("#partner-info");
   const name = document.createElement("span");
   name.className = "name";
   name.textContent = partner.name;
   info.replaceChildren(avatar(partner), name, langBadge(partner.lang));
   info.querySelector(".avatar").style.cssText = "width:30px;height:30px;font-size:13px";
-  setRoomEnabled(true);
-  systemMessage(T.roomStart(partner.name));
-  show("room");
-  $("#msg-input").focus();
-});
+  info.classList.toggle("offline", !online);
+}
 
 socket.on("room:partner-left", () => partnerGone(T.partnerLeft));
 
+socket.on("partner:status", ({ online }) => {
+  if (!state.partner) return;
+  renderPartner(state.partner, online);
+  systemMessage(online ? `✅ ${T.partnerBack}` : `📶 ${T.partnerOffline}`);
+  if (online) call?.recover();
+});
+
 function partnerGone(text) {
+  clearTimeout(repairTimer);
+  repairTimer = null;
   call?.abort();
   systemMessage(text);
   setRoomEnabled(false);
   state.partner = null;
+  if (state.roomCode) socket.emit("link:cancel");
 }
 
 function setRoomEnabled(on) {
@@ -348,8 +462,11 @@ function setRoomEnabled(on) {
 $("#leave-btn").addEventListener("click", () => {
   call?.hangup();
   socket.emit("room:leave");
+  clearTimeout(repairTimer);
+  repairTimer = null;
   state.roomOpen = false;
   state.partner = null;
+  state.roomCode = null;
   show("lobby");
   renderUsers();
 });
@@ -425,14 +542,14 @@ function renderEntry(entry, kind) {
   return record;
 }
 
-function applyTranslation({ id, text, ok, lang }) {
+function applyTranslation({ id, text, ok, lang, error }) {
   const r = messageEls.get(id);
   if (!r) return null;
   r.translation = ok ? text : null;
   r.main.classList.remove("pending");
   const original = r.entry.text;
   if (!ok) {
-    r.subText.replaceChildren(`⚠️ ${T.translateFailed}`);
+    r.subText.replaceChildren(`⚠️ ${error === "daily_limit" ? T.dailyLimit : T.translateFailed}`);
     return r;
   }
   if (r.mine) {
@@ -504,8 +621,8 @@ let partnerCapTimer = null;
 let myCapTimer = null;
 let lastMyCaptionId = null;
 
-function setupCall(iceServers) {
-  call = new Call(socket, iceServers);
+function setupCall() {
+  call = new Call(socket, getIceServers);
 
   call.addEventListener("incoming", () => {
     if (!state.partner) return call.decline();
@@ -525,7 +642,12 @@ function setupCall(iceServers) {
     if (detail.state === "active") startRecognition();
   });
   call.addEventListener("connection", ({ detail }) => {
-    if (detail.state === "connected") startTimer();
+    if (detail.state === "connected") {
+      if (!callTimer) startTimer();
+      $("#stage").classList.remove("reconnecting");
+    } else if (detail.state === "reconnecting" || detail.state === "disconnected") {
+      $("#stage").classList.add("reconnecting");
+    }
   });
   call.addEventListener("ended", ({ detail }) => {
     closeModal("incoming-call");
@@ -556,11 +678,33 @@ function openStage() {
   ["#cap-partner-interim", "#cap-me", "#cap-me-translated"].forEach((sel) => ($(sel).textContent = ""));
   state.mic = true;
   $("#mic-btn").classList.add("on");
+  keepAwake(true);
 }
+
+// Keep the screen on during a call: on phones a locked screen can pause the mic and the page.
+let wakeLock = null;
+async function keepAwake(on) {
+  if (!on) {
+    wakeLock?.release().catch(() => {});
+    wakeLock = null;
+    return;
+  }
+  try {
+    wakeLock = (await navigator.wakeLock?.request("screen")) ?? null;
+  } catch {
+    wakeLock = null; // not supported, or the page is hidden
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  // The browser drops the lock when the page is hidden; take it again when we come back.
+  if (document.visibilityState === "visible" && !$("#stage").hidden) keepAwake(true);
+});
 
 function closeStage() {
   $("#stage").hidden = true;
+  $("#stage").classList.remove("reconnecting");
   $("#call-btn").hidden = false;
+  keepAwake(false);
   stopRecognition();
   window.speechSynthesis?.cancel();
   clearInterval(callTimer);
@@ -576,7 +720,13 @@ function startTimer() {
     const s = Math.floor((Date.now() - started) / 1000);
     const mm = String(Math.floor(s / 60)).padStart(2, "0");
     const ss = String(s % 60).padStart(2, "0");
-    const live = !state.mic ? ` · 🔇 ${T.mutedHint}` : recognizer?.running ? ` · 🎙️ ${T.listening}` : "";
+    const live = $("#stage").classList.contains("reconnecting")
+      ? ` · 📶 ${T.reconnecting}`
+      : !state.mic
+        ? ` · 🔇 ${T.mutedHint}`
+        : recognizer?.running
+          ? ` · 🎙️ ${T.listening}`
+          : "";
     $("#call-status").textContent = `${mm}:${ss}${live}`;
   };
   tick();
@@ -674,4 +824,8 @@ $("#mic-btn").addEventListener("click", () => {
 });
 
 // Hook for automated tests and debugging (simulates a finished spoken sentence).
-window.__koja = { sendSpeech: (text) => socket.emit("speech:final", { text }), state };
+window.__koja = {
+  sendSpeech: (text) => socket.emit("speech:final", { text }),
+  dropConnection: () => socket.io.engine.close(), // simulates a network blip; socket.io reconnects by itself
+  state,
+};
