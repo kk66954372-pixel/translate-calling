@@ -94,19 +94,31 @@ export async function translate(text, from, to, context = []) {
     return { text: "", ok: false, error: "daily_limit" };
   }
 
+  const result = await callModel(MODEL, input, from, to, context);
+  if (result.ok && cacheKey && result.text) cacheSet(cacheKey, result.text);
+  return { text: result.text, ok: result.ok, ...(result.error ? { error: result.error } : {}) };
+}
+
+// Models with the server-side refusal fallback. Claude Haiku 5.5 has none (sending it would fail).
+const HAS_FALLBACK = /^claude-(opus|sonnet|fable)-/;
+
+/**
+ * One translation request to a given model (no cache, no daily quota). Also used by the model comparison.
+ * @returns {Promise<{text: string, ok: boolean, error?: string, usage?: {input: number, output: number}, ms: number}>}
+ */
+export async function callModel(model, input, from, to, context = []) {
   const contextBlock = context.length
     ? `<context>\n${context.map((c) => `${escapeXml(c.speaker)}: ${escapeXml(c.text)}`).join("\n")}\n</context>\n\n`
     : "";
-
+  const started = Date.now();
   try {
     const response = await getClient().beta.messages.create({
-      model: MODEL,
+      model,
       max_tokens: 4000,
       // Translation is latency-sensitive and simple: keep effort low.
       output_config: { effort: "low" },
       // If the model declines, the API retries the same request on a fallback model.
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
+      ...(HAS_FALLBACK.test(model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
       system: SYSTEM_PROMPT,
       messages: [
         {
@@ -117,19 +129,17 @@ export async function translate(text, from, to, context = []) {
         },
       ],
     });
+    const ms = Date.now() - started;
+    const usage = { input: response.usage?.input_tokens ?? 0, output: response.usage?.output_tokens ?? 0 };
 
-    if (response.stop_reason === "refusal") {
-      return { text: "", ok: false, error: "refusal" };
-    }
+    if (response.stop_reason === "refusal") return { text: "", ok: false, error: "refusal", usage, ms };
 
     const out = response.content
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("")
       .trim();
-
-    if (cacheKey && out) cacheSet(cacheKey, out);
-    return { text: out, ok: true };
+    return { text: out, ok: true, usage, ms };
   } catch (error) {
     let reason = "unknown";
     if (error instanceof Anthropic.AuthenticationError) reason = "auth";
@@ -138,8 +148,8 @@ export async function translate(text, from, to, context = []) {
     else if (error instanceof Anthropic.APIError && error.status === 402) reason = "no_credit";
     else if (error instanceof Anthropic.APIError) reason = `api_${error.status ?? "error"}`;
     else if (error instanceof Anthropic.AnthropicError) reason = "config"; // e.g. no credentials configured
-    console.error(`[translate] ${reason}:`, error?.message || error);
-    return { text: "", ok: false, error: reason };
+    console.error(`[translate] ${model} ${reason}:`, error?.message || error);
+    return { text: "", ok: false, error: reason, ms: Date.now() - started };
   }
 }
 

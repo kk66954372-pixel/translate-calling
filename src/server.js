@@ -645,4 +645,8 @@ server.listen(PORT, () => {
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }
+  // One-off translation model comparison (results go to the log). Turn the variable off afterwards.
+  if (process.env.TRANSLATION_COMPARE === "1") {
+    import("./compare.js").then((m) => m.runCompare()).catch((e) => console.error("[compare] failed:", e.message));
+  }
 });
