@@ -134,7 +134,8 @@ export async function translate(text, from, to, context = []) {
     let reason = "unknown";
     if (error instanceof Anthropic.AuthenticationError) reason = "auth";
     else if (error instanceof Anthropic.RateLimitError) reason = "rate_limit";
-    else if (error instanceof Anthropic.BadRequestError) reason = "bad_request";
+    else if (error instanceof Anthropic.BadRequestError) reason = /credit balance/i.test(error.message) ? "no_credit" : "bad_request";
+    else if (error instanceof Anthropic.APIError && error.status === 402) reason = "no_credit";
     else if (error instanceof Anthropic.APIError) reason = `api_${error.status ?? "error"}`;
     else if (error instanceof Anthropic.AnthropicError) reason = "config"; // e.g. no credentials configured
     console.error(`[translate] ${reason}:`, error?.message || error);

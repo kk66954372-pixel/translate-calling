@@ -2,6 +2,7 @@ import "./inapp.js";
 import { STRINGS, SPEECH_LANG, FLAG } from "./i18n.js";
 import { Call } from "./rtc.js";
 import { Recognizer, speechSupported, speak, isSpeaking } from "./speech.js";
+import { ServerSTT } from "./stt.js";
 
 /* global io */
 const socket = io();
@@ -150,6 +151,12 @@ if (pendingJoin) {
 }
 
 // Fetched again for every call so short-lived TURN credentials are always fresh.
+// Server features (is server-side speech recognition available?), fetched once at startup.
+fetch("/api/config")
+  .then((r) => r.json())
+  .then((c) => (state.stt = c.stt ?? null))
+  .catch(() => {});
+
 const getIceServers = () =>
   fetch("/api/config")
     .then((r) => r.json())
@@ -389,6 +396,7 @@ function enterRoom({ code, partner }) {
   if (repairing) {
     systemMessage(`✅ ${T.reconnected}`);
     call?.recover();
+    restartServerStt();
     return;
   }
   call?.abort();
@@ -406,6 +414,7 @@ function resumeRoom({ code, partner }) {
   renderPartner(partner, true);
   setRoomEnabled(true);
   call?.recover();
+  restartServerStt();
 }
 
 /** We reconnected but the server no longer knows our room (it restarted, or we were gone too long). */
@@ -421,6 +430,13 @@ function lostRoom() {
   socket.emit("link:join", { code: state.roomCode }, (res) => {
     if (!res?.ok) partnerGone(T.partnerLeft);
   });
+}
+
+/** After a reconnect the server has forgotten our speech stream: open a new one. */
+function restartServerStt() {
+  if (!serverStt?.running) return;
+  serverStt.stop();
+  startRecognition();
 }
 
 function renderPartner(partner, online) {
@@ -549,7 +565,8 @@ function applyTranslation({ id, text, ok, lang, error }) {
   r.main.classList.remove("pending");
   const original = r.entry.text;
   if (!ok) {
-    r.subText.replaceChildren(`⚠️ ${error === "daily_limit" ? T.dailyLimit : T.translateFailed}`);
+    const why = { daily_limit: T.dailyLimit, no_credit: T.noCredit }[error] ?? T.translateFailed;
+    r.subText.replaceChildren(`⚠️ ${why}`);
     return r;
   }
   if (r.mine) {
@@ -628,7 +645,14 @@ function setupCall() {
     if (!state.partner) return call.decline();
     openModal("incoming-call", `📞 ${T.incomingCall(state.partner.name)}`, [
       { label: T.decline, onClick: () => call.decline() },
-      { label: T.accept, cls: "primary", onClick: () => call.accept().catch(() => toast(T.mediaError)) },
+      {
+        label: T.accept,
+        cls: "primary",
+        onClick: () => {
+          getServerStt()?.prime();
+          call.accept().catch(() => toast(T.mediaError));
+        },
+      },
     ]);
   });
 
@@ -701,6 +725,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function closeStage() {
+  serverSttFailed = false;
   $("#stage").hidden = true;
   $("#stage").classList.remove("reconnecting");
   $("#call-btn").hidden = false;
@@ -724,7 +749,7 @@ function startTimer() {
       ? ` · 📶 ${T.reconnecting}`
       : !state.mic
         ? ` · 🔇 ${T.mutedHint}`
-        : recognizer?.running
+        : recognizer?.running || serverStt?.running
           ? ` · 🎙️ ${T.listening}`
           : "";
     $("#call-status").textContent = `${mm}:${ss}${live}`;
@@ -745,7 +770,49 @@ function showMyCaption(text, translated = "") {
   }
 }
 
-function startRecognition() {
+// Call captions: prefer server-side recognition (works on phones, uses the echo-cancelled call audio);
+// fall back to the browser's own speech recognition when the server has none or it fails.
+let serverStt = null;
+let serverSttFailed = false;
+
+function getServerStt() {
+  if (!state.stt) return null;
+  serverStt ??= new ServerSTT(socket, {
+    shouldPause: () => isSpeaking() || !state.mic,
+    onInterim: (text) => showMyCaption(text),
+    onError: (code) => {
+      serverSttFailed = true;
+      if (code === "no_credit") toast(`⚠️ ${T.sttNoCredit}`, 6000);
+      else if (code === "daily_limit") toast(`⚠️ ${T.sttDailyLimit}`, 6000);
+      if (!$("#stage").hidden && state.mic) startBrowserRecognition();
+    },
+  });
+  return serverStt;
+}
+
+async function startRecognition() {
+  if (!state.mic) return;
+  const stt = !serverSttFailed && call?.localStream ? getServerStt() : null;
+  if (stt) {
+    if (stt.running) return;
+    if (await stt.start(call.localStream)) {
+      if (!state.mic || $("#stage").hidden) stt.stop(); // muted or hung up while it was starting
+      else showHeadphoneTip();
+      return;
+    }
+    serverSttFailed = true;
+  }
+  startBrowserRecognition();
+}
+
+function showHeadphoneTip() {
+  if (!load("tipShown", false)) {
+    toast(`🎧 ${T.headphoneTip}`, 6000);
+    save("tipShown", true);
+  }
+}
+
+function startBrowserRecognition() {
   if (!speechSupported) return toast(T.speechUnsupported, 6000);
   if (!state.mic) return;
   if (!recognizer) {
@@ -772,13 +839,11 @@ function startRecognition() {
   }
   recognizer.lang = SPEECH_LANG[state.me.lang];
   recognizer.start();
-  if (!load("tipShown", false)) {
-    toast(`🎧 ${T.headphoneTip}`, 6000);
-    save("tipShown", true);
-  }
+  showHeadphoneTip();
 }
 function stopRecognition() {
   recognizer?.stop();
+  serverStt?.stop();
 }
 
 // Partner is speaking: show their words live (original language) until the translation arrives.
@@ -789,7 +854,10 @@ socket.on("speech:interim", ({ text }) => {
 
 socket.on("caption", (cap) => {
   renderEntry(cap, "caption");
-  if (cap.from === state.me.id) lastMyCaptionId = cap.id;
+  if (cap.from === state.me.id) {
+    lastMyCaptionId = cap.id;
+    showMyCaption(cap.text);
+  }
   else {
     $("#cap-partner-interim").textContent = "";
     $("#stage").classList.remove("speaking");
@@ -809,7 +877,10 @@ socket.on("caption:translation", (t) => {
   partnerCapTimer = setTimeout(() => setPartnerCaption(""), 12000);
 });
 
-$("#call-btn").addEventListener("click", () => call?.start().catch(() => toast(T.mediaError)));
+$("#call-btn").addEventListener("click", () => {
+  getServerStt()?.prime(); // iOS only allows audio processing to start from a tap
+  call?.start().catch(() => toast(T.mediaError));
+});
 $("#hangup-btn").addEventListener("click", () => call?.hangup());
 
 $("#mic-btn").addEventListener("click", () => {

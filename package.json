@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "dev:mock": "TRANSLATOR=mock node --watch src/server.js"
+    "dev:mock": "TRANSLATOR=mock STT=mock node --watch src/server.js"
   },
   "repository": {
     "type": "git",
@@ -20,7 +20,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
     "express": "^4.22.3",
-    "socket.io": "^4.8.4"
+    "socket.io": "^4.8.4",
+    "ws": "^8.21.3"
   },
   "type": "module",
   "engines": {

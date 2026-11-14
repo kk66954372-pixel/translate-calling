@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import { translate, translatorInfo, LANGS } from "./translator.js";
 import { iceServers, turnInfo } from "./ice.js";
+import { openStream, sttInfo, sttEnabled } from "./stt.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -19,7 +20,7 @@ const io = new Server(server, { maxHttpBufferSize: 64 * 1024 });
 app.use(express.static(path.join(here, "..", "public")));
 
 app.get("/api/config", async (_req, res) => {
-  res.json({ translator: translatorInfo.mode, iceServers: await iceServers() });
+  res.json({ translator: translatorInfo.mode, stt: sttEnabled ? sttInfo.mode : null, iceServers: await iceServers() });
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
@@ -187,6 +188,27 @@ const allow = (userId) => {
 
 const clean = (v, max) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 
+function speechInterim(u, text) {
+  const partner = u && partnerOf(u.id);
+  if (partner) toUser(partner.id).emit("speech:interim", { text: clean(text, 300) });
+}
+
+async function speechFinal(u, text) {
+  const partner = u && partnerOf(u.id);
+  const body = clean(text, 500);
+  if (!u || !partner || !body) return;
+  if (!allow(u.id)) return;
+
+  const room = rooms.get(u.roomId);
+  const caption = { id: randomUUID(), from: u.id, name: u.name, lang: u.lang, text: body, ts: Date.now() };
+  toRoom(room).emit("caption", caption);
+
+  const context = [...room.history];
+  remember(room, u.name, body);
+  const result = await translate(body, u.lang, partner.lang, context);
+  toRoom(room).emit("caption:translation", { id: caption.id, lang: partner.lang, ...result });
+}
+
 io.on("connection", (socket) => {
   const me = () => users.get(bySocket.get(socket.id));
 
@@ -326,28 +348,38 @@ io.on("connection", (socket) => {
   });
 
   // ---- Call: live speech captions -------------------------------------------
-  socket.on("speech:interim", ({ text } = {}) => {
+  // Text comes either from the browser's own speech recognition (speech:*) or from server-side STT (stt:*).
+  socket.on("speech:interim", ({ text } = {}) => speechInterim(me(), text));
+  socket.on("speech:final", ({ text } = {}) => speechFinal(me(), text));
+
+  let stt = null;
+  const stopStt = () => {
+    stt?.close();
+    stt = null;
+  };
+  socket.on("stt:start", (_p, ack) => {
     const u = me();
-    const partner = u && partnerOf(u.id);
-    if (partner) toUser(partner.id).emit("speech:interim", { text: clean(text, 300) });
+    if (!u || !partnerOf(u.id)) return ack?.({ ok: false, error: "no_room" });
+    stopStt();
+    const userId = u.id;
+    stt = openStream({
+      lang: u.lang,
+      onInterim: (text) => {
+        socket.emit("stt:interim", { text });
+        speechInterim(users.get(userId), text);
+      },
+      onFinal: (text) => speechFinal(users.get(userId), text),
+      onError: (error) => {
+        stt = null;
+        socket.emit("stt:error", { error });
+      },
+    });
+    ack?.(stt ? { ok: true } : { ok: false, error: "unavailable" });
   });
-
-  socket.on("speech:final", async ({ text } = {}) => {
-    const u = me();
-    const partner = u && partnerOf(u.id);
-    const body = clean(text, 500);
-    if (!u || !partner || !body) return;
-    if (!allow(u.id)) return;
-
-    const room = rooms.get(u.roomId);
-    const caption = { id: randomUUID(), from: u.id, name: u.name, lang: u.lang, text: body, ts: Date.now() };
-    toRoom(room).emit("caption", caption);
-
-    const context = [...room.history];
-    remember(room, u.name, body);
-    const result = await translate(body, u.lang, partner.lang, context);
-    toRoom(room).emit("caption:translation", { id: caption.id, lang: partner.lang, ...result });
+  socket.on("stt:audio", (chunk) => {
+    if (stt && Buffer.isBuffer(chunk) && chunk.length <= 16_000) stt.write(chunk);
   });
+  socket.on("stt:stop", stopStt);
 
   // ---- Call: signaling (WebRTC media flows peer-to-peer) ---------------------
   const relay = (event) =>
@@ -359,6 +391,7 @@ io.on("connection", (socket) => {
   ["call:request", "call:accept", "call:decline", "call:cancel", "call:end", "rtc:signal"].forEach(relay);
 
   socket.on("disconnect", () => {
+    stopStt();
     const id = bySocket.get(socket.id);
     bySocket.delete(socket.id);
     const u = users.get(id);
@@ -381,7 +414,8 @@ io.on("connection", (socket) => {
 
 server.listen(PORT, () => {
   const t = translatorInfo.mode === "mock" ? "mock (no API calls)" : `Claude (${translatorInfo.model})`;
-  console.log(`Language exchange server on http://localhost:${PORT}  ·  translator: ${t}  ·  ICE: ${turnInfo()}`);
+  const s = sttEnabled ? `${sttInfo.mode}${sttInfo.mode === "deepgram" ? ` (${sttInfo.model})` : ""}` : "browser only (set DEEPGRAM_API_KEY for phones)";
+  console.log(`Language exchange server on http://localhost:${PORT}  ·  translator: ${t}  ·  speech-to-text: ${s}  ·  ICE: ${turnInfo()}`);
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }

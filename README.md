@@ -16,7 +16,7 @@
 | 번역 채팅 | 보낸 메시지가 즉시 상대 언어로 번역. 받은 메시지는 **번역문 + 원문**을 함께 보여 줘서 공부가 됩니다. 내 메시지에는 "상대에게 보이는 문장"이 표시됩니다. |
 | 🔊 발음 듣기 | 원문/번역문 옆 버튼으로 원어 발음을 TTS로 들을 수 있습니다. |
 | 음성 통화 | WebRTC P2P 음성 통화. 상대에게는 내 실제 목소리가 들립니다. 마이크 on/off |
-| 실시간 통화 자막 | 말하면 브라우저 음성 인식 → 서버에서 번역 → 상대 화면에 **번역 자막**. 상대가 말하는 중에는 원문이 실시간으로 보이고, 문장이 끝나면 번역이 뜹니다. |
+| 실시간 통화 자막 | 말하면 음성 인식 → 서버에서 번역 → 상대 화면에 **번역 자막**. 상대가 말하는 중에는 원문이 실시간으로 보이고, 문장이 끝나면 번역이 뜹니다. 음성 인식은 `DEEPGRAM_API_KEY`가 있으면 서버(Deepgram)에서 하고 — **휴대폰에서도 동작** — 없으면 브라우저 음성 인식을 씁니다. |
 | 내 말 확인 | 통화 화면 아래에 "나: 내가 한 말 → 상대에게 보인 번역"이 표시돼서, 내 말이 일본어로 어떻게 전달됐는지 배울 수 있습니다. |
 | 통화 기록 | 통화 중 문장도 채팅창에 원문+번역으로 남아 나중에 복습할 수 있습니다. |
 
@@ -33,7 +33,7 @@ npm install
 export ANTHROPIC_API_KEY=sk-ant-...
 npm start
 
-# API 키 없이 UI만 테스트 (번역 대신 "[ko→ja] 원문" 형태로 표시)
+# API 키 없이 UI만 테스트 (번역 대신 "[ko→ja] 원문", 통화 중엔 가짜 음성 인식 "테스트 음성 N번")
 npm run dev:mock
 ```
 
@@ -43,7 +43,11 @@ npm run dev:mock
 
 | 이름 | 기본값 | 설명 |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | – | Claude API 키 |
+| `ANTHROPIC_API_KEY` | – | Claude API 키 (번역) |
+| `DEEPGRAM_API_KEY` | – | Deepgram API 키 (통화 음성 인식). 있으면 서버 음성 인식을 사용해 휴대폰에서도 자막이 동작 |
+| `STT` | 키가 있으면 `deepgram`, 없으면 `off` | `mock` 은 테스트용 가짜 음성 인식, `off` 는 브라우저 음성 인식만 사용 |
+| `DEEPGRAM_MODEL` | `nova-3` | Deepgram 모델 |
+| `DAILY_STT_MINUTES` | `600` | 하루 최대 음성 인식 분량(분). `0`이면 무제한 |
 | `TRANSLATOR` | `claude` | `mock` 으로 두면 API 호출 없이 동작 |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | 번역에 쓸 모델 |
 | `PORT` | `3000` | 서버 포트 |
@@ -66,26 +70,30 @@ npm run dev:mock
 src/server.js       Express + Socket.IO: 로비, 매칭, 채팅, 통화 시그널링, 번역 호출
 src/translator.js   Claude API 번역 (문맥 포함, 짧은 문구 캐시, 하루 한도, mock 모드)
 src/ice.js          WebRTC ICE/TURN 서버 설정 (Cloudflare TURN 임시 자격증명)
+src/stt.js          서버 음성 인식 (Deepgram 실시간 스트리밍, mock)
 public/index.html   단일 페이지 (설정 → 로비 → 대화방)
 public/js/app.js    화면/채팅/통화 UI 로직
 public/js/rtc.js    WebRTC 1:1 음성 통화 (offer/answer/ICE)
 public/js/speech.js 음성 인식(Web Speech API) + 🔊 발음 듣기용 TTS
 public/js/i18n.js   한국어/일본어 UI 문자열
 public/js/inapp.js  카톡/LINE 등 앱 내 브라우저 감지 → 외부 브라우저로 열기
+public/js/stt.js    통화 마이크 소리를 서버 음성 인식으로 전송
+public/js/pcm-worklet.js  마이크 소리 → 16kHz PCM 변환 (AudioWorklet)
 docs/PLAN.md        완성 계획과 체크리스트
 ```
 
 통화 번역 흐름:
 
 ```
-[내 마이크] → 브라우저 음성인식(ko-KR/ja-JP) → socket "speech:final"
-   → 서버: Claude 번역 → socket "caption:translation" → [상대 화면 자막 + TTS]
+[내 마이크] → 16kHz PCM → socket "stt:audio" → 서버 → Deepgram 음성인식
+            (키가 없으면: 브라우저 음성인식 → socket "speech:final")
+   → 서버: Claude 번역 → socket "caption:translation" → [상대 화면 자막]
 [목소리 자체]는 WebRTC로 상대와 직접(P2P) 연결 — 번역 음성(TTS)은 쓰지 않음
 ```
 
 ## 알아둘 점
 
-- **음성 인식은 PC의 Chrome / Edge 권장**입니다 (Web Speech API). Firefox는 통화·채팅은 되지만 통화 자막이 꺼집니다. 모바일 브라우저는 통화와 음성 인식을 동시에 하면 불안정할 수 있습니다.
+- `DEEPGRAM_API_KEY`가 없으면 브라우저 음성 인식을 쓰므로 **PC의 Chrome / Edge 권장**입니다. 휴대폰에서 통화 자막을 쓰려면 Deepgram 키를 넣으세요.
 - 마이크는 **HTTPS 또는 localhost**에서만 동작합니다. 배포 시 HTTPS가 필요합니다.
 - **이어폰 사용을 권장**합니다. 스피커로 나온 상대 목소리를 내 마이크가 다시 듣게 되면, 그 소리가 내 자막으로 잘못 인식될 수 있습니다.
 - 서로 다른 네트워크(특히 모바일 데이터, 회사망) 간 통화는 STUN만으로 연결이 안 될 수 있어 **TURN 서버**(`CF_TURN_KEY_ID`/`CF_TURN_API_TOKEN` 또는 `ICE_SERVERS`)가 필요합니다.

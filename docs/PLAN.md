@@ -18,7 +18,7 @@
 | 해결하는 문제 | 카톡/LINE 안 브라우저에서 마이크가 막히는 문제 | 휴대폰에서 통화 + 음성인식을 동시에 못 하는 문제 |
 | 필요성 | **필수** (B안을 해도 통화 자체가 마이크를 쓰므로 필요) | **휴대폰 자막의 진짜 해결책** |
 | 비용 | 0원 | Deepgram 가입 시 무료 크레딧(약 $200, 수백 시간 분량) → 이후 1시간 약 $0.5 내외 |
-| 장점 | 간단 | ① 통화에 쓰는 마이크 소리를 그대로 서버로 보내므로 마이크 충돌 없음 ② 에코 제거된 소리를 쓰므로 스피커 소리가 내 자막으로 잡히는 문제 감소 ③ 한국어·일본어를 **섞어 말해도** 인식 가능 (언어교환에 딱 맞음) |
+| 장점 | 간단 | ① 통화에 쓰는 마이크 소리를 그대로 서버로 보내므로 마이크 충돌 없음 ② 에코 제거된 소리를 쓰므로 스피커 소리가 내 자막으로 잡히는 문제 감소 |
 
 → **둘 다 합니다. A안은 지금 바로, B안은 Deepgram 키를 받은 뒤.** 키가 없을 때는 지금처럼 브라우저 음성인식으로 자동 대체됩니다.
 
@@ -26,11 +26,11 @@
 
 ## 내가(사용자) 할 일
 
-- [ ] **1. Claude API 키 넣기** — console.anthropic.com → API Keys → 키 생성 → [Render Environment](https://dashboard.render.com/web/srv-dbqta48m7kps73dmmnk0/env)에 `ANTHROPIC_API_KEY` 추가 (채팅에 붙여넣지 말 것)
-- [ ] **2. Claude 콘솔에서 월 사용 한도 설정** — Console → Settings → Limits (예: $10). 앱 자체에도 하루 번역 한도가 있습니다.
+- [x] **1. Claude API 키 넣기** — console.anthropic.com → API Keys → 키 생성 → [Render Environment](https://dashboard.render.com/web/srv-dbqta48m7kps73dmmnk0/env)에 `ANTHROPIC_API_KEY` 추가 (채팅에 붙여넣지 말 것)
+- [x] **2. Claude 콘솔에서 월 사용 한도 설정** — Console → Settings → Limits (예: $10). 앱 자체에도 하루 번역 한도가 있습니다.
 - [ ] **3. Cloudflare TURN 키 만들기** (다른 나라/모바일 데이터 간 통화 연결용, 월 1,000GB 무료)
       dash.cloudflare.com → Realtime → TURN Server → Create → 나오는 `Key ID`와 `API Token`을 Render에 `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` 으로 추가
-- [ ] **4. Deepgram 가입 + API 키** (B안) — console.deepgram.com → API Keys → Render에 `DEEPGRAM_API_KEY` 추가
+- [x] **4. Deepgram 가입 + API 키** (B안) — console.deepgram.com → API Keys → Render에 `DEEPGRAM_API_KEY` 추가
 - [ ] **5. 친구와 실제 테스트** — 아래 "실기기 테스트" 표를 채워서 알려 주세요.
 
 ## 개발 체크리스트 (Claude가 진행)
@@ -47,9 +47,12 @@
 - [x] **비용 안전장치** — 하루 번역 횟수 한도 (`DAILY_TRANSLATION_LIMIT`, 기본 2000회 ≈ Opus 기준 최대 약 $10/일)
 
 ### 2단계 — 휴대폰 통화 자막 (B안, Deepgram 키 필요)
-- [ ] 통화 마이크 소리를 16kHz로 변환해 서버로 전송 (AudioWorklet)
-- [ ] 서버 ↔ Deepgram 실시간 스트리밍 (Nova-3, 한·일 섞어 말하기 지원)
-- [ ] 키가 없거나 실패하면 브라우저 음성인식으로 자동 대체
+- [x] 통화 마이크 소리를 16kHz로 변환해 서버로 전송 (AudioWorklet)
+- [x] 서버 ↔ Deepgram 실시간 스트리밍 (Nova-3, 각자 모국어로 인식)
+- [x] 키가 없거나 실패하면 브라우저 음성인식으로 자동 대체
+- [x] 음소거 중에는 소리를 보내지 않음 (비용 절약), 재접속 후 자동 재시작
+- [x] 크레딧 부족/하루 한도 안내 문구 (Claude·Deepgram 모두), 하루 음성인식 한도 `DAILY_STT_MINUTES` (기본 600분)
+- [ ] 실제 Deepgram으로 한국어·일본어 인식 확인 (배포 후 실기기 테스트)
 
 ### 3단계 — 속도와 품질
 - [ ] 번역 지연 측정 표시 (개발용) → Opus vs Haiku 비교 후 기본값 결정
