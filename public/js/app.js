@@ -3,6 +3,7 @@ import { STRINGS, SPEECH_LANG, FLAG } from "./i18n.js";
 import { Call } from "./rtc.js";
 import { Recognizer, speechSupported, speak, isSpeaking } from "./speech.js";
 import { ServerSTT } from "./stt.js";
+import * as pwa from "./pwa.js";
 
 /* global io */
 const socket = io();
@@ -10,15 +11,15 @@ const $ = (sel) => document.querySelector(sel);
 
 const state = {
   me: null,
-  partner: null,
-  roomOpen: false,
+  rooms: new Map(), // roomId -> summary {id, partner, last, unread}
+  roomId: null, // the room shown on screen
   users: [],
   translator: "claude",
+  stt: null,
+  vapid: null,
   matching: false,
   modal: null, // { kind, data }
   mic: true,
-  roomCode: null, // code of the room link the current room came from (if any)
-  waiting: false, // waiting in my room link for my friend
 };
 let T = STRINGS.ko;
 let call = null;
@@ -35,21 +36,19 @@ function load(key, fallback) {
 }
 function save(key, value) {
   try {
-    localStorage.setItem(`koja:${key}`, JSON.stringify(value));
+    if (value === null) localStorage.removeItem(`koja:${key}`);
+    else localStorage.setItem(`koja:${key}`, JSON.stringify(value));
   } catch {}
 }
 
-// A private id for this browser tab. After a dropped connection the server uses it to give us our
-// room back. sessionStorage (not localStorage) so two tabs in the same browser stay two different users.
-const cid = (() => {
-  try {
-    let v = sessionStorage.getItem("koja:cid");
-    if (!v) sessionStorage.setItem("koja:cid", (v = crypto.randomUUID()));
-    return v;
-  } catch {
-    return crypto.randomUUID();
-  }
-})();
+// Things to do once we are signed in, taken from the URL:
+//   ?room=CODE         invite link        ?open=ROOM(&call=1)  opened from a notification
+//   ?t=TOKEN           first launch of the Home Screen app (sign in as the user it was installed from)
+const params = new URLSearchParams(location.search);
+let pendingJoin = params.get("room");
+let pendingOpen = params.get("open");
+let pendingToken = params.get("t");
+if ([...params.keys()].length) history.replaceState(null, "", location.pathname);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -79,8 +78,7 @@ function toast(text, ms = 3200) {
 function openModal(kind, text, buttons, data = null) {
   state.modal = { kind, data };
   $("#modal-text").textContent = text;
-  const actions = $("#modal-actions");
-  actions.replaceChildren(
+  $("#modal-actions").replaceChildren(
     ...buttons.map(({ label, cls = "", onClick }) => {
       const b = document.createElement("button");
       b.className = `btn ${cls}`;
@@ -114,12 +112,42 @@ function langBadge(lang) {
   return el;
 }
 
+const locale = () => (state.me?.lang === "ja" ? "ja-JP" : "ko-KR");
 function timeStr(ts) {
-  return new Date(ts).toLocaleTimeString(state.me?.lang === "ja" ? "ja-JP" : "ko-KR", { hour: "2-digit", minute: "2-digit" });
+  return new Date(ts).toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" });
+}
+function shortWhen(ts) {
+  const d = new Date(ts);
+  return d.toDateString() === new Date().toDateString() ? timeStr(ts) : d.toLocaleDateString(locale(), { month: "numeric", day: "numeric" });
+}
+function ago(ts) {
+  const min = Math.floor((Date.now() - ts) / 60000);
+  if (min < 1) return T.justNow;
+  if (min < 60) return T.minutesAgo(min);
+  if (min < 60 * 24) return T.hoursAgo(Math.floor(min / 60));
+  return T.daysAgo(Math.floor(min / 1440));
+}
+function statusText(p) {
+  if (p.online) return `● ${T.statusOnline}`;
+  return p.lastSeen ? T.lastSeen(ago(p.lastSeen)) : T.statusOffline;
+}
+
+const linkUrl = (code) => `${location.origin}/?room=${code}&openExternalBrowser=1`;
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = Object.assign(document.createElement("textarea"), { value: text });
+    document.body.append(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Setup
+// Sign-in. The server knows us by a secret key kept in localStorage.
 // ---------------------------------------------------------------------------
 const saved = load("profile", null);
 if (saved) {
@@ -128,8 +156,6 @@ if (saved) {
   if (radio) radio.checked = true;
 }
 
-// Opened from an invite link (/?room=CODE): greet the friend and preselect their language.
-let pendingJoin = new URLSearchParams(location.search).get("room");
 if (pendingJoin) {
   fetch(`/api/link/${encodeURIComponent(pendingJoin)}`)
     .then((r) => (r.ok ? r.json() : null))
@@ -138,11 +164,13 @@ if (pendingJoin) {
       const banner = $("#invite-banner");
       if (info?.host) {
         const { name, lang } = info.host;
-        banner.textContent = `💌 ${name}님이 기다리고 있어요 · ${name}さんが待っています`;
-        const radio = document.querySelector(`input[name=lang][value="${lang === "ko" ? "ja" : "ko"}"]`);
-        if (radio) radio.checked = true;
+        banner.textContent = `💌 ${name}님이 초대했어요 · ${name}さんから招待が届きました`;
+        if (!load("profile", null)) {
+          const radio = document.querySelector(`input[name=lang][value="${lang === "ko" ? "ja" : "ko"}"]`);
+          if (radio) radio.checked = true;
+        }
       } else if (info?.ok) {
-        banner.textContent = "💌 초대 링크로 들어왔어요. 친구가 들어오면 바로 연결돼요 · 招待リンクから入りました。友達が来るとすぐにつながります";
+        banner.textContent = "💌 초대 링크로 들어왔어요 · 招待リンクから入りました";
       } else {
         banner.textContent = `⚠️ ${STRINGS.ko.linkExpired} / ${STRINGS.ja.linkExpired}`;
       }
@@ -150,11 +178,13 @@ if (pendingJoin) {
     });
 }
 
-// Fetched again for every call so short-lived TURN credentials are always fresh.
-// Server features (is server-side speech recognition available?), fetched once at startup.
 fetch("/api/config")
   .then((r) => r.json())
-  .then((c) => (state.stt = c.stt ?? null))
+  .then((c) => {
+    state.stt = c.stt ?? null;
+    state.vapid = c.vapidPublicKey ?? null;
+    renderAppCard();
+  })
   .catch(() => {});
 
 const getIceServers = () =>
@@ -167,55 +197,91 @@ $("#setup-form").addEventListener("submit", (e) => {
   const name = $("#nickname").value.trim();
   const lang = document.querySelector("input[name=lang]:checked").value;
   if (!name) return;
-  setProfile(name, lang);
+  save("profile", { name, lang });
+  hello();
 });
 
-function setProfile(name, lang) {
-  socket.emit("profile:set", { name, lang, cid }, (res) => {
+$("#code-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  redeem($("#code-input").value.trim(), true);
+});
+
+/** Exchange a 6-digit code (typed) or token (from the Home Screen app's start URL) for this user's key. */
+function redeem(code, typed = false) {
+  socket.emit("transfer:redeem", { code }, (res) => {
+    if (res?.ok) {
+      save("key", res.key);
+      hello();
+    } else {
+      if (typed) toast(`⚠️ ${STRINGS.ko.codeInvalid} · ${STRINGS.ja.codeInvalid}`, 5000);
+      else hello();
+    }
+  });
+}
+
+function hello() {
+  const key = load("key", null);
+  const profile = load("profile", null);
+  if (!key && pendingToken) {
+    const token = pendingToken;
+    pendingToken = null;
+    return redeem(token);
+  }
+  if (!key && !profile) return show("setup");
+  socket.emit("hello", { key, name: profile?.name, lang: profile?.lang }, (res) => {
+    if (res?.needProfile) {
+      save("key", null);
+      return show("setup");
+    }
     if (!res?.ok) return toast("⚠️");
     const reconnect = Boolean(state.me);
+    if (res.key) save("key", res.key);
     state.me = res.me;
     state.translator = res.translator;
-    T = STRINGS[lang];
-    save("profile", { name, lang });
+    save("profile", { name: res.me.name, lang: res.me.lang });
+    T = STRINGS[res.me.lang];
+    state.rooms = new Map(res.rooms.map((r) => [r.id, r]));
     if (!call) setupCall();
     applyI18n();
     renderMe();
-    renderLink();
+    renderRooms();
+    renderAppCard();
     $("#mock-banner").hidden = state.translator !== "mock";
+    sendPresence();
+    pwa.subscribePush(state.vapid).then(sendSubscription).catch(() => {});
     if (reconnect) setOffline(false);
 
-    if (res.room) {
-      // The server kept our seat while we were gone: carry on where we left off.
-      if (state.roomOpen) resumeRoom(res.room);
-      else enterRoom(res.room);
-    } else if (state.roomOpen && state.partner) {
-      lostRoom();
-    } else if (!state.roomOpen) {
-      show("lobby");
+    if (state.roomId) {
+      // Reconnected while a room is open: re-sync it (and keep any ongoing call).
+      openRoom(state.roomId, { resync: true });
+      call?.recover();
+      restartServerStt();
+    } else if (pendingJoin) {
+      joinByLink();
+    } else if (pendingOpen) {
+      const id = pendingOpen;
+      pendingOpen = null;
+      openRoom(id);
+    } else {
+      show("home");
     }
-
-    if (pendingJoin) joinByLink();
-    else if (state.waiting && !res.waitingCode && !state.roomOpen) createLink(); // e.g. the server restarted
   });
 }
 
 function joinByLink() {
   const code = pendingJoin.toLowerCase();
   pendingJoin = null;
-  history.replaceState(null, "", location.pathname);
   socket.emit("link:join", { code }, (res) => {
-    if (!res?.ok) return toast(res?.error === "busy" ? T.partnerBusy : T.linkExpired, 5000);
-    // The friend's link becomes "our room" on this device too, so either of us can open it next time.
-    save("roomCode", res.code);
-    setWaiting(res.waiting);
+    if (!res?.ok) {
+      show("home");
+      return toast(res?.error === "full" ? T.linkFull : T.linkExpired, 5000);
+    }
+    if (res.waiting) show("home");
+    else openRoom(res.roomId);
   });
 }
 
-socket.on("connect", () => {
-  // Re-register after a reconnect. The server recognises our cid and gives us our room back.
-  if (state.me) setProfile(state.me.name, state.me.lang);
-});
+socket.on("connect", hello);
 socket.on("disconnect", () => {
   if (state.me) setOffline(true);
 });
@@ -225,12 +291,31 @@ function setOffline(on) {
   clearTimeout(offlineTimer);
   document.body.classList.toggle("offline", on);
   // Short blips are common on phones: only say something if it lasts.
-  if (on) offlineTimer = setTimeout(() => toast(`📶 ${T.disconnected}`, 60000), 1500);
+  if (on) offlineTimer = setTimeout(() => toast(`📶 ${T.disconnected}`, 60000), 2500);
   else if ($("#toast").textContent.includes(T.disconnected)) toast(`✅ ${T.reconnected}`);
 }
 
+function sendPresence() {
+  socket.emit("presence", { visible: document.visibilityState === "visible" });
+}
+document.addEventListener("visibilitychange", () => {
+  sendPresence();
+  if (document.visibilityState === "visible" && state.roomId) socket.emit("room:read", { roomId: state.roomId });
+});
+
+function sendSubscription(sub) {
+  if (sub) socket.emit("push:subscribe", { subscription: sub });
+}
+
+// Opened from a notification while the app was already running.
+navigator.serviceWorker?.addEventListener("message", (e) => {
+  if (e.data?.type !== "open") return;
+  const id = new URL(e.data.url, location.origin).searchParams.get("open");
+  if (id && state.me) openRoom(id);
+});
+
 // ---------------------------------------------------------------------------
-// Lobby
+// Home: my rooms, invite link, app install / notifications, people online
 // ---------------------------------------------------------------------------
 function renderMe() {
   const chip = $("#me-chip");
@@ -238,6 +323,182 @@ function renderMe() {
   chip.querySelector(".avatar").style.cssText = "width:28px;height:28px;font-size:13px";
 }
 
+function sortedRooms() {
+  return [...state.rooms.values()].sort((a, b) => (b.last?.ts ?? 0) - (a.last?.ts ?? 0));
+}
+
+function renderRooms() {
+  if (!state.me) return;
+  const rooms = sortedRooms();
+  const paired = rooms.filter((r) => r.partner);
+  const waiting = rooms.find((r) => !r.partner);
+
+  $("#rooms-empty").hidden = paired.length > 0;
+  $("#room-list").replaceChildren(
+    ...paired.map((r) => {
+      const li = document.createElement("li");
+      li.className = "room-row";
+      li.onclick = () => openRoom(r.id);
+      const av = avatar(r.partner);
+      if (r.partner.online) av.classList.add("online");
+      const mid = document.createElement("div");
+      mid.className = "room-mid";
+      const name = document.createElement("b");
+      name.textContent = r.partner.name;
+      const last = document.createElement("small");
+      last.textContent = r.last ? `${r.last.kind === "caption" ? "🎙️ " : ""}${r.last.text}` : statusText(r.partner);
+      mid.append(name, last);
+      const side = document.createElement("div");
+      side.className = "room-side";
+      const when = document.createElement("small");
+      when.textContent = r.last ? shortWhen(r.last.ts) : "";
+      side.append(when);
+      if (r.unread) {
+        const badge = document.createElement("span");
+        badge.className = "unread";
+        badge.textContent = r.unread > 99 ? "99+" : String(r.unread);
+        side.append(badge);
+      }
+      li.append(av, mid, side);
+      return li;
+    }),
+  );
+
+  // The invite link of a room that is still waiting for my friend.
+  $("#link-btn").hidden = Boolean(waiting);
+  $("#link-box").hidden = !waiting;
+  if (waiting) $("#link-url").value = linkUrl(waiting.id);
+
+  pwa.setBadge(paired.reduce((n, r) => n + (r.unread || 0), 0));
+}
+
+socket.on("room:summary", (summary) => {
+  state.rooms.set(summary.id, summary);
+  renderRooms();
+  if (summary.id === state.roomId) renderPartner();
+});
+
+socket.on("presence", ({ userId, online, lastSeen }) => {
+  for (const r of state.rooms.values()) {
+    if (r.partner?.id === userId) Object.assign(r.partner, { online, lastSeen });
+  }
+  renderRooms();
+  renderPartner();
+});
+
+socket.on("room:joined-by", ({ roomId, user }) => {
+  toast(`🎉 ${T.friendJoined(user.name)}`, 5000);
+  if (!state.roomId && $("#screen-home").classList.contains("active")) openRoom(roomId);
+});
+
+socket.on("room:start", ({ roomId }) => {
+  closeModal();
+  setMatching(false);
+  openRoom(roomId);
+});
+
+$("#link-btn").addEventListener("click", () => {
+  socket.emit("link:create", { code: load("roomCode", null) }, (res) => {
+    if (!res?.ok) return toast("⚠️");
+    save("roomCode", null); // legacy single saved code: no longer needed
+  });
+});
+$("#copy-btn").addEventListener("click", async () => {
+  await copyText($("#link-url").value);
+  toast(T.copied);
+});
+if (navigator.share) {
+  $("#share-btn").hidden = false;
+  $("#share-btn").addEventListener("click", () =>
+    navigator.share({ title: "KoJa Talk", text: T.shareText, url: $("#link-url").value }).catch(() => {}),
+  );
+}
+
+// ---- App card: install on the Home Screen, turn on notifications ----------------------------------
+let transferCode = null;
+
+function renderAppCard() {
+  const card = $("#app-card");
+  if (!state.me) return;
+  const notif = pwa.notificationState();
+  const body = $("#app-card-body");
+  const actions = $("#app-card-actions");
+  actions.replaceChildren();
+
+  if (pwa.isIOS && !pwa.isStandalone) {
+    // iPhone: notifications only work in the Home Screen app, which has its own storage → give it a code.
+    card.hidden = false;
+    $("#app-card-title").textContent = `📲 ${T.installTitle}`;
+    body.innerHTML = "";
+    const steps = document.createElement("ol");
+    steps.className = "steps";
+    for (const s of [T.iosStep1, T.iosStep2, T.iosStep3]) {
+      const li = document.createElement("li");
+      li.innerHTML = s;
+      steps.append(li);
+    }
+    const code = document.createElement("div");
+    code.className = "transfer-code";
+    code.textContent = transferCode ?? "······";
+    body.append(steps, code);
+    if (!transferCode) requestTransferCode();
+    return;
+  }
+
+  if (notif === "default" && state.vapid) {
+    card.hidden = false;
+    $("#app-card-title").textContent = `🔔 ${T.notifTitle}`;
+    body.textContent = T.notifDesc;
+    const b = document.createElement("button");
+    b.className = "btn primary";
+    b.textContent = T.notifOn;
+    b.onclick = async () => {
+      const sub = await pwa.subscribePush(state.vapid, { ask: true }).catch(() => null);
+      if (sub) {
+        sendSubscription(sub);
+        toast(`🔔 ${T.notifEnabled}`);
+      } else if (pwa.notificationState() === "denied") toast(T.notifDenied, 6000);
+      renderAppCard();
+    };
+    actions.append(b);
+    return;
+  }
+
+  if (notif === "denied") {
+    card.hidden = false;
+    $("#app-card-title").textContent = `🔕 ${T.notifTitle}`;
+    body.textContent = T.notifDenied;
+    return;
+  }
+
+  if (pwa.installPrompt && !pwa.isStandalone) {
+    card.hidden = false;
+    $("#app-card-title").textContent = `📲 ${T.installTitle}`;
+    body.textContent = T.installDesc;
+    const b = document.createElement("button");
+    b.className = "btn primary";
+    b.textContent = T.install;
+    b.onclick = () => pwa.installPrompt.prompt();
+    actions.append(b);
+    return;
+  }
+
+  card.hidden = true;
+}
+window.addEventListener("koja:installable", renderAppCard);
+
+function requestTransferCode() {
+  const key = load("key", null);
+  if (!key) return;
+  socket.emit("transfer:create", { key }, (res) => {
+    if (!res?.ok) return;
+    transferCode = res.code;
+    pwa.setManifestToken(res.token);
+    renderAppCard();
+  });
+}
+
+// ---- People online, invites, random matching ----------------------------------------------------
 socket.on("users:update", (list) => {
   state.users = list;
   renderUsers();
@@ -245,9 +506,8 @@ socket.on("users:update", (list) => {
 
 function renderUsers() {
   if (!state.me) return;
-  const others = state.users
-    .filter((u) => u.id !== state.me.id)
-    .sort((a, b) => (a.lang === state.me.lang) - (b.lang === state.me.lang) || a.busy - b.busy);
+  const friends = new Map([...state.rooms.values()].filter((r) => r.partner).map((r) => [r.partner.id, r.id]));
+  const others = state.users.filter((u) => u.id !== state.me.id).sort((a, b) => (a.lang === state.me.lang) - (b.lang === state.me.lang));
   $("#online-count").textContent = others.length ? `${others.length}` : "";
   $("#nobody").hidden = others.length > 0;
   $("#user-list").replaceChildren(
@@ -262,10 +522,11 @@ function renderUsers() {
       who.append(b, small);
       const btn = document.createElement("button");
       btn.className = "btn primary";
+      const roomId = friends.get(u.id);
       const same = u.lang === state.me.lang;
-      btn.textContent = u.busy ? T.busy : same ? T.sameLang : T.invite;
-      btn.disabled = u.busy || same || state.roomOpen;
-      btn.onclick = () => sendInvite(u);
+      btn.textContent = roomId ? T.openChat : same ? T.sameLang : T.invite;
+      btn.disabled = !roomId && same;
+      btn.onclick = () => (roomId ? openRoom(roomId) : sendInvite(u));
       li.append(avatar(u), who, btn);
       return li;
     }),
@@ -275,16 +536,12 @@ function renderUsers() {
 function sendInvite(user) {
   socket.emit("invite:send", { to: user.id }, (res) => {
     if (!res?.ok) return toast(T.partnerBusy);
-    openModal("outgoing-invite", T.inviting(user.name), [
-      { label: T.cancel, onClick: () => socket.emit("invite:cancel") },
-    ]);
+    openModal("outgoing-invite", T.inviting(user.name), [{ label: T.cancel, onClick: () => socket.emit("invite:cancel") }]);
   });
 }
 
 socket.on("invite:received", ({ from }) => {
-  if (state.modal || state.roomOpen) {
-    return socket.emit("invite:respond", { from: from.id, accept: false });
-  }
+  if (state.modal) return socket.emit("invite:respond", { from: from.id, accept: false });
   openModal(
     "incoming-invite",
     T.inviteFrom(from.name),
@@ -298,69 +555,16 @@ socket.on("invite:received", ({ from }) => {
 socket.on("invite:cancelled", ({ from }) => {
   if (state.modal?.kind === "incoming-invite" && state.modal.data?.id === from) closeModal();
 });
-socket.on("invite:declined", ({ reason }) => {
+socket.on("invite:declined", () => {
   closeModal("outgoing-invite");
-  toast(reason === "busy" ? T.partnerBusy : T.declined);
+  toast(T.declined);
 });
-
-// ---- Room link ------------------------------------------------------------------
-// One permanent link per pair of friends. Whoever opens it first waits; the second person is connected.
-// openExternalBrowser=1 makes LINE open the link in Safari/Chrome instead of its in-app browser.
-const linkUrl = (code) => `${location.origin}${location.pathname}?room=${code}&openExternalBrowser=1`;
-
-function createLink() {
-  socket.emit("link:create", { code: load("roomCode", null) }, (res) => {
-    if (!res?.ok) return toast(res?.error === "busy" ? T.partnerBusy : "⚠️");
-    save("roomCode", res.code);
-    setWaiting(res.waiting);
-  });
-}
-
-function setWaiting(on) {
-  state.waiting = Boolean(on);
-  renderLink();
-}
-
-function renderLink() {
-  const code = load("roomCode", null);
-  $("#link-btn").hidden = Boolean(code);
-  $("#link-box").hidden = !code;
-  if (!code) return;
-  $("#link-url").value = linkUrl(code);
-  $(".invite-card").classList.toggle("waiting", state.waiting);
-  $("#link-status").textContent = state.waiting ? T.linkWaiting : T.linkIdle;
-  $("#wait-btn").textContent = state.waiting ? T.stopWaiting : T.enterRoom;
-  $("#wait-btn").classList.toggle("primary", !state.waiting);
-}
-
-$("#link-btn").addEventListener("click", () => createLink());
-$("#wait-btn").addEventListener("click", () => {
-  if (!state.waiting) return createLink();
-  socket.emit("link:cancel");
-  setWaiting(false);
-});
-$("#copy-btn").addEventListener("click", async () => {
-  const url = $("#link-url").value;
-  try {
-    await navigator.clipboard.writeText(url);
-  } catch {
-    $("#link-url").select();
-    document.execCommand("copy");
-  }
-  toast(T.copied);
-});
-if (navigator.share) {
-  $("#share-btn").hidden = false;
-  $("#share-btn").addEventListener("click", () =>
-    navigator.share({ title: "KoJa Talk", text: T.shareText, url: $("#link-url").value }).catch(() => {}),
-  );
-}
 
 $("#match-btn").addEventListener("click", () => {
   if (state.matching) return setMatching(false, true);
   setMatching(true);
   socket.emit("match:find", null, (res) => {
-    if (!res?.ok) setMatching(false);
+    if (!res?.ok || res.matched) setMatching(false);
   });
 });
 
@@ -372,101 +576,74 @@ function setMatching(on, notify = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Room: chat
+// Room: chat history + live chat
 // ---------------------------------------------------------------------------
-socket.on("room:joined", (room) => enterRoom(room));
-
-let repairTimer = null;
-
-function enterRoom({ code, partner }) {
-  closeModal();
-  setMatching(false);
-  setWaiting(false);
-  // Same friend again on the same room link right after losing the room (e.g. the server restarted):
-  // keep the conversation and the call going instead of starting over.
-  const repairing = Boolean(repairTimer) && state.roomOpen && state.lastPartner?.name === partner.name;
-  clearTimeout(repairTimer);
-  repairTimer = null;
-  state.partner = partner;
-  state.lastPartner = partner;
-  state.roomOpen = true;
-  state.roomCode = code ?? null;
-  renderPartner(partner, true);
-  setRoomEnabled(true);
-  if (repairing) {
-    systemMessage(`✅ ${T.reconnected}`);
-    call?.recover();
-    restartServerStt();
-    return;
-  }
-  call?.abort();
-  messageEls.clear();
-  $("#messages").replaceChildren();
-  systemMessage(T.roomStart(partner.name));
-  show("room");
-  $("#msg-input").focus();
-}
-
-/** We reconnected and the server still had our room. */
-function resumeRoom({ code, partner }) {
-  state.partner = partner;
-  state.roomCode = code ?? null;
-  renderPartner(partner, true);
-  setRoomEnabled(true);
-  call?.recover();
-  restartServerStt();
-}
-
-/** We reconnected but the server no longer knows our room (it restarted, or we were gone too long). */
-function lostRoom() {
-  if (!state.roomCode) return partnerGone(T.partnerLeft);
-  // Both of us will come back to the same room link: wait there for a while before giving up.
-  renderPartner(state.partner, false);
-  clearTimeout(repairTimer);
-  repairTimer = setTimeout(() => {
-    repairTimer = null;
-    partnerGone(T.partnerLeft);
-  }, 30_000);
-  socket.emit("link:join", { code: state.roomCode }, (res) => {
-    if (!res?.ok) partnerGone(T.partnerLeft);
+function openRoom(roomId, { resync = false } = {}) {
+  socket.emit("room:open", { roomId }, (res) => {
+    if (!res?.ok) {
+      if (state.roomId === roomId) leaveRoomScreen();
+      return show("home");
+    }
+    const switching = state.roomId !== roomId;
+    if (switching && call && call.state !== "idle" && call.roomId !== roomId) call.hangup();
+    state.roomId = roomId;
+    state.rooms.set(roomId, res.room);
+    renderRooms();
+    renderPartner();
+    messageEls.clear();
+    $("#messages").replaceChildren();
+    for (const m of res.messages) {
+      renderEntry(m, m.kind);
+      if (m.ok !== null && m.ok !== undefined) applyTranslation({ id: m.id, text: m.translation, ok: m.ok, lang: m.tlang, error: m.error });
+    }
+    if (!res.messages.length && res.room.partner) systemMessage(T.roomStart(res.room.partner.name));
+    if (!res.room.partner) systemMessage(T.alone);
+    setRoomEnabled(Boolean(res.room.partner));
+    const list = $("#messages");
+    list.scrollTop = list.scrollHeight;
+    show("room");
+    if (!resync && switching && !matchMedia("(pointer: coarse)").matches) $("#msg-input").focus();
   });
 }
 
-/** After a reconnect the server has forgotten our speech stream: open a new one. */
-function restartServerStt() {
-  if (!serverStt?.running) return;
-  serverStt.stop();
-  startRecognition();
+function leaveRoomScreen() {
+  if (call && call.state !== "idle") call.hangup();
+  socket.emit("room:close");
+  state.roomId = null;
+  show("home");
+  renderRooms();
+  renderUsers();
 }
 
-function renderPartner(partner, online) {
+const currentRoom = () => (state.roomId ? state.rooms.get(state.roomId) : null);
+
+function renderPartner() {
+  const room = currentRoom();
+  if (!room) return;
   const info = $("#partner-info");
+  if (!room.partner) {
+    info.replaceChildren(document.createTextNode(T.waitingFriend));
+    return;
+  }
+  const p = room.partner;
+  const av = avatar(p);
+  av.style.cssText = "width:30px;height:30px;font-size:13px";
+  if (p.online) av.classList.add("online");
+  const text = document.createElement("div");
+  text.className = "partner-text";
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = partner.name;
-  info.replaceChildren(avatar(partner), name, langBadge(partner.lang));
-  info.querySelector(".avatar").style.cssText = "width:30px;height:30px;font-size:13px";
-  info.classList.toggle("offline", !online);
+  name.textContent = p.name;
+  const status = document.createElement("small");
+  status.className = `status ${p.online ? "on" : ""}`;
+  status.textContent = statusText(p);
+  text.append(name, status);
+  info.replaceChildren(av, text, langBadge(p.lang));
 }
-
-socket.on("room:partner-left", () => partnerGone(T.partnerLeft));
-
-socket.on("partner:status", ({ online }) => {
-  if (!state.partner) return;
-  renderPartner(state.partner, online);
-  systemMessage(online ? `✅ ${T.partnerBack}` : `📶 ${T.partnerOffline}`);
-  if (online) call?.recover();
-});
-
-function partnerGone(text) {
-  clearTimeout(repairTimer);
-  repairTimer = null;
-  call?.abort();
-  systemMessage(text);
-  setRoomEnabled(false);
-  state.partner = null;
-  if (state.roomCode) socket.emit("link:cancel");
-}
+setInterval(() => {
+  // keep "3분 전 접속" fresh
+  if (state.roomId) renderPartner();
+}, 60_000);
 
 function setRoomEnabled(on) {
   $("#msg-input").disabled = !on;
@@ -475,17 +652,7 @@ function setRoomEnabled(on) {
   $("#typing").hidden = true;
 }
 
-$("#leave-btn").addEventListener("click", () => {
-  call?.hangup();
-  socket.emit("room:leave");
-  clearTimeout(repairTimer);
-  repairTimer = null;
-  state.roomOpen = false;
-  state.partner = null;
-  state.roomCode = null;
-  show("lobby");
-  renderUsers();
-});
+$("#leave-btn").addEventListener("click", leaveRoomScreen);
 
 function systemMessage(text) {
   const li = document.createElement("li");
@@ -570,11 +737,9 @@ function applyTranslation({ id, text, ok, lang, error }) {
     return r;
   }
   if (r.mine) {
-    // Big: what I wrote. Small: what my partner sees.
     r.subText.replaceChildren(text);
     r.sub.append(ttsButton(() => text, lang));
   } else {
-    // Big: translation into my language. Small: the original, for learning.
     r.main.textContent = text;
     r.subText.replaceChildren(original);
     r.sub.append(ttsButton(() => original, r.entry.lang));
@@ -583,24 +748,26 @@ function applyTranslation({ id, text, ok, lang, error }) {
 }
 
 socket.on("chat:message", (msg) => {
+  if (msg.roomId !== state.roomId) return;
   renderEntry(msg, "chat");
   if (msg.from !== state.me.id) $("#typing").hidden = true;
 });
-socket.on("chat:translation", (t) => applyTranslation(t));
+socket.on("chat:translation", (t) => t.roomId === state.roomId && applyTranslation(t));
 
 let typingSent = false;
 let typingTimer;
+const sendTyping = (typing) => state.roomId && socket.emit("chat:typing", { roomId: state.roomId, typing });
 $("#msg-input").addEventListener("input", (e) => {
   const el = e.target;
   el.style.height = "auto";
   el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   if (!typingSent) {
-    socket.emit("chat:typing", true);
+    sendTyping(true);
     typingSent = true;
   }
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => {
-    socket.emit("chat:typing", false);
+    sendTyping(false);
     typingSent = false;
   }, 1800);
 });
@@ -614,22 +781,25 @@ $("#composer").addEventListener("submit", (e) => {
   e.preventDefault();
   const input = $("#msg-input");
   const text = input.value.trim();
-  if (!text || !state.partner) return;
-  socket.emit("chat:send", { text }, (res) => {
+  if (!text || !state.roomId) return;
+  socket.emit("chat:send", { roomId: state.roomId, text }, (res) => {
     if (res?.error === "rate_limited") toast("⏳");
+    else if (res?.error === "alone") toast(T.alone);
   });
   input.value = "";
   input.style.height = "auto";
   clearTimeout(typingTimer);
-  socket.emit("chat:typing", false);
+  sendTyping(false);
   typingSent = false;
 });
-socket.on("chat:typing", (on) => ($("#typing").hidden = !on));
+socket.on("chat:typing", ({ roomId, typing }) => {
+  if (roomId === state.roomId) $("#typing").hidden = !typing;
+});
 
 // ---------------------------------------------------------------------------
 // Room: voice call + live translated captions
 //   - My real voice goes to my partner over WebRTC (no synthetic voice).
-//   - The browser turns my speech into text, the server translates it,
+//   - My speech becomes text (server STT, or the browser's), the server translates it,
 //     and my partner sees it on screen in their language.
 // ---------------------------------------------------------------------------
 const remoteAudio = $("#remote-audio");
@@ -641,19 +811,24 @@ let lastMyCaptionId = null;
 function setupCall() {
   call = new Call(socket, getIceServers);
 
-  call.addEventListener("incoming", () => {
-    if (!state.partner) return call.decline();
-    openModal("incoming-call", `📞 ${T.incomingCall(state.partner.name)}`, [
-      { label: T.decline, onClick: () => call.decline() },
-      {
-        label: T.accept,
-        cls: "primary",
-        onClick: () => {
-          getServerStt()?.prime();
-          call.accept().catch(() => toast(T.mediaError));
+  call.addEventListener("incoming", ({ detail }) => {
+    const ring = () => {
+      const room = state.rooms.get(detail.roomId);
+      const name = room?.partner?.name ?? "";
+      openModal("incoming-call", `📞 ${T.incomingCall(name)}`, [
+        { label: T.decline, onClick: () => call.decline() },
+        {
+          label: T.accept,
+          cls: "primary",
+          onClick: () => {
+            getServerStt()?.prime();
+            call.accept().catch(() => toast(T.mediaError));
+          },
         },
-      },
-    ]);
+      ]);
+    };
+    if (state.roomId !== detail.roomId) openRoom(detail.roomId); // the call is for a room that is not on screen
+    ring();
   });
 
   call.addEventListener("local-stream", () => openStage());
@@ -664,6 +839,9 @@ function setupCall() {
   call.addEventListener("state", ({ detail }) => {
     $("#call-status").textContent = T.calling;
     if (detail.state === "active") startRecognition();
+  });
+  call.addEventListener("ringing", ({ detail }) => {
+    if (call.state === "outgoing") $("#call-status").textContent = detail.notified ? T.notifiedPartner : T.calling;
   });
   call.addEventListener("connection", ({ detail }) => {
     if (detail.state === "connected") {
@@ -676,7 +854,7 @@ function setupCall() {
   call.addEventListener("ended", ({ detail }) => {
     closeModal("incoming-call");
     closeStage();
-    if (detail.reason === "declined") toast(T.callDeclined);
+    if (detail.reason === "declined" || detail.reason === "no_answer") toast(T.callDeclined);
     else if (detail.reason === "media_error") toast(T.mediaError);
     if (detail.was === "active") systemMessage(`📞 ${T.callEnded}`);
   });
@@ -693,10 +871,11 @@ function openStage() {
   $("#stage").hidden = false;
   $("#call-btn").hidden = true;
   const av = $("#remote-avatar");
-  if (state.partner) {
-    av.className = `avatar-big ${state.partner.lang}`;
-    av.textContent = [...state.partner.name][0]?.toUpperCase() ?? "?";
-    $("#call-name").textContent = state.partner.name;
+  const p = currentRoom()?.partner;
+  if (p) {
+    av.className = `avatar-big ${p.lang}`;
+    av.textContent = [...p.name][0]?.toUpperCase() ?? "?";
+    $("#call-name").textContent = p.name;
   }
   setPartnerCaption("");
   ["#cap-partner-interim", "#cap-me", "#cap-me-translated"].forEach((sel) => ($(sel).textContent = ""));
@@ -716,11 +895,10 @@ async function keepAwake(on) {
   try {
     wakeLock = (await navigator.wakeLock?.request("screen")) ?? null;
   } catch {
-    wakeLock = null; // not supported, or the page is hidden
+    wakeLock = null;
   }
 }
 document.addEventListener("visibilitychange", () => {
-  // The browser drops the lock when the page is hidden; take it again when we come back.
   if (document.visibilityState === "visible" && !$("#stage").hidden) keepAwake(true);
 });
 
@@ -770,7 +948,7 @@ function showMyCaption(text, translated = "") {
   }
 }
 
-// Call captions: prefer server-side recognition (works on phones, uses the echo-cancelled call audio);
+// Captions: prefer server-side recognition (works on phones, uses the echo-cancelled call audio);
 // fall back to the browser's own speech recognition when the server has none or it fails.
 let serverStt = null;
 let serverSttFailed = false;
@@ -791,12 +969,12 @@ function getServerStt() {
 }
 
 async function startRecognition() {
-  if (!state.mic) return;
-  const stt = !serverSttFailed && call?.localStream ? getServerStt() : null;
+  if (!state.mic || !call?.roomId) return;
+  const stt = !serverSttFailed && call.localStream ? getServerStt() : null;
   if (stt) {
     if (stt.running) return;
-    if (await stt.start(call.localStream)) {
-      if (!state.mic || $("#stage").hidden) stt.stop(); // muted or hung up while it was starting
+    if (await stt.start(call.localStream, call.roomId)) {
+      if (!state.mic || $("#stage").hidden) stt.stop();
       else showHeadphoneTip();
       return;
     }
@@ -825,12 +1003,12 @@ function startBrowserRecognition() {
         const now = Date.now();
         if (now - lastInterim > 350) {
           lastInterim = now;
-          socket.emit("speech:interim", { text });
+          socket.emit("speech:interim", { roomId: call?.roomId, text });
         }
       },
       onFinal: (text) => {
         showMyCaption(text);
-        socket.emit("speech:final", { text });
+        socket.emit("speech:final", { roomId: call?.roomId, text });
       },
       onState: (st) => {
         if (st === "denied") toast(T.speechDenied);
@@ -846,29 +1024,37 @@ function stopRecognition() {
   serverStt?.stop();
 }
 
+/** After a reconnect the server has forgotten our speech stream: open a new one. */
+function restartServerStt() {
+  if (!serverStt?.running) return;
+  serverStt.stop();
+  startRecognition();
+}
+
 // Partner is speaking: show their words live (original language) until the translation arrives.
-socket.on("speech:interim", ({ text }) => {
+socket.on("speech:interim", ({ roomId, text }) => {
+  if (roomId !== state.roomId) return;
   $("#cap-partner-interim").textContent = text ? `${text}…` : "";
   $("#stage").classList.toggle("speaking", Boolean(text));
 });
 
 socket.on("caption", (cap) => {
+  if (cap.roomId !== state.roomId) return;
   renderEntry(cap, "caption");
   if (cap.from === state.me.id) {
     lastMyCaptionId = cap.id;
     showMyCaption(cap.text);
-  }
-  else {
+  } else {
     $("#cap-partner-interim").textContent = "";
     $("#stage").classList.remove("speaking");
   }
 });
 
 socket.on("caption:translation", (t) => {
+  if (t.roomId !== state.roomId) return;
   const r = applyTranslation(t);
   if (!r || !t.ok) return;
   if (r.mine) {
-    // Let me see how my sentence was shown to my partner (good for learning).
     if (t.id === lastMyCaptionId) showMyCaption(r.entry.text, t.text);
     return;
   }
@@ -878,8 +1064,9 @@ socket.on("caption:translation", (t) => {
 });
 
 $("#call-btn").addEventListener("click", () => {
+  if (!state.roomId) return;
   getServerStt()?.prime(); // iOS only allows audio processing to start from a tap
-  call?.start().catch(() => toast(T.mediaError));
+  call?.start(state.roomId).catch(() => toast(T.mediaError));
 });
 $("#hangup-btn").addEventListener("click", () => call?.hangup());
 
@@ -894,9 +1081,10 @@ $("#mic-btn").addEventListener("click", () => {
   }
 });
 
-// Hook for automated tests and debugging (simulates a finished spoken sentence).
+// Hooks for automated tests and debugging.
 window.__koja = {
-  sendSpeech: (text) => socket.emit("speech:final", { text }),
+  sendSpeech: (text) => socket.emit("speech:final", { roomId: state.roomId, text }),
   dropConnection: () => socket.io.engine.close(), // simulates a network blip; socket.io reconnects by itself
+  setVisible: (visible) => socket.emit("presence", { visible }),
   state,
 };

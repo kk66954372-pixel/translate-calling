@@ -9,6 +9,9 @@
 | 기능 | 설명 |
 |---|---|
 | 프로필 | 닉네임 + 모국어(한국어/日本語) 선택. UI가 내 언어로 표시됩니다. |
+| 홈 화면 앱 | 아이폰 Safari → 공유 → **홈 화면에 추가**하면 앱처럼 열립니다 (Android/PC는 "설치" 버튼). 앱을 닫아 두어도 **새 메시지·전화 알림**이 옵니다 (iOS 16.4+). |
+| 대화방 | 카톡처럼 대화방이 계속 유지됩니다. 대화 기록(채팅·통화 자막)이 저장되고, 안 읽은 메시지 수와 상대의 접속 상태("온라인", "3분 전 접속")가 보입니다. |
+| 부재 중 전화 | 상대가 앱 밖에 있으면 알림으로 전화를 알리고, 상대가 앱을 열면 바로 울립니다 (45초). 받지 못하면 "부재중 전화" 알림. |
 | 고정 방 링크 | 로비에서 "초대 링크 만들기" → 카톡/LINE으로 친구에게 전송. **같은 링크를 계속 사용**합니다. 먼저 들어온 사람이 기다리고, 나중에 들어온 사람과 바로 연결됩니다. 친구 화면에는 "○○さんが待っています"가 뜨고 일본어가 미리 선택됩니다. |
 | 외부 브라우저 열기 | 카톡·LINE·인스타 앱 안에서 링크를 열면 Chrome/Safari로 자동으로 넘기고, 안 되면 방법을 안내합니다 (앱 내 브라우저는 마이크가 막히는 경우가 많음). |
 | 재접속 유지 | 휴대폰 신호가 잠깐 끊기거나 서버가 재시작돼도 60초 동안 방과 통화를 유지하고, 다시 연결되면 그대로 이어집니다. 통화 중 와이파이↔LTE가 바뀌면 통화를 자동 복구합니다. |
@@ -44,6 +47,8 @@ npm run dev:mock
 | 이름 | 기본값 | 설명 |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | – | Claude API 키 (번역) |
+| `DATABASE_URL` | – | Postgres 연결 문자열 (예: Neon 무료). **배포 시 필수** — 없으면 계정·대화방·기록이 메모리에만 있어 서버가 재시작/잠들면 사라짐 |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | 자동 생성 | 푸시 알림 서버 키. 비워 두면 처음 시작할 때 만들어 DB에 저장 |
 | `DEEPGRAM_API_KEY` | – | Deepgram API 키 (통화 음성 인식). 있으면 서버 음성 인식을 사용해 휴대폰에서도 자막이 동작 |
 | `STT` | 키가 있으면 `deepgram`, 없으면 `off` | `mock` 은 테스트용 가짜 음성 인식, `off` 는 브라우저 음성 인식만 사용 |
 | `DEEPGRAM_MODEL` | `nova-3` | Deepgram 모델 |
@@ -71,6 +76,8 @@ src/server.js       Express + Socket.IO: 로비, 매칭, 채팅, 통화 시그�
 src/translator.js   Claude API 번역 (문맥 포함, 짧은 문구 캐시, 하루 한도, mock 모드)
 src/ice.js          WebRTC ICE/TURN 서버 설정 (Cloudflare TURN 임시 자격증명)
 src/stt.js          서버 음성 인식 (Deepgram 실시간 스트리밍, mock)
+src/store.js        저장소: 사용자·대화방·메시지·푸시 구독 (Postgres 또는 메모리)
+src/push.js         Web Push 알림 (VAPID)
 public/index.html   단일 페이지 (설정 → 로비 → 대화방)
 public/js/app.js    화면/채팅/통화 UI 로직
 public/js/rtc.js    WebRTC 1:1 음성 통화 (offer/answer/ICE)
@@ -78,6 +85,8 @@ public/js/speech.js 음성 인식(Web Speech API) + 🔊 발음 듣기용 TTS
 public/js/i18n.js   한국어/일본어 UI 문자열
 public/js/inapp.js  카톡/LINE 등 앱 내 브라우저 감지 → 외부 브라우저로 열기
 public/js/stt.js    통화 마이크 소리를 서버 음성 인식으로 전송
+public/js/pwa.js    홈 화면 앱: 서비스 워커 등록, 푸시 구독, 설치 안내, 배지
+public/sw.js        서비스 워커: 푸시 알림 표시, 알림 누르면 앱 열기
 public/js/pcm-worklet.js  마이크 소리 → 16kHz PCM 변환 (AudioWorklet)
 docs/PLAN.md        완성 계획과 체크리스트
 ```
@@ -97,5 +106,6 @@ docs/PLAN.md        완성 계획과 체크리스트
 - 마이크는 **HTTPS 또는 localhost**에서만 동작합니다. 배포 시 HTTPS가 필요합니다.
 - **이어폰 사용을 권장**합니다. 스피커로 나온 상대 목소리를 내 마이크가 다시 듣게 되면, 그 소리가 내 자막으로 잘못 인식될 수 있습니다.
 - 서로 다른 네트워크(특히 모바일 데이터, 회사망) 간 통화는 STUN만으로 연결이 안 될 수 있어 **TURN 서버**(`CF_TURN_KEY_ID`/`CF_TURN_API_TOKEN` 또는 `ICE_SERVERS`)가 필요합니다.
-- 상태(접속자, 대화방)는 서버 메모리에만 저장됩니다. 회원가입/DB/신고 기능은 아직 없습니다.
+- 로그인은 기기에 저장된 비밀 키로 합니다(회원가입 없음). 아이폰 홈 화면 앱은 Safari와 저장 공간이 따로라서, 처음 열 때 Safari에 표시된 6자리 코드로 계정을 이어받습니다.
+- 아이폰 푸시 알림은 **홈 화면에 추가한 앱**에서만 동작합니다 (Safari 탭에서는 불가).
 - WebSocket을 쓰므로 Vercel 같은 서버리스보다는 Render, Fly.io, Railway 같은 상시 실행 서버에 배포하세요.

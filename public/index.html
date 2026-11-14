@@ -6,6 +6,13 @@
   <title>KoJa Talk · 코자톡 · コジャトーク</title>
   <meta name="description" content="한국어 ↔ 日本語 실시간 번역 채팅 & 통화 언어교환" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#2f5bea" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="KoJa Talk" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
@@ -33,17 +40,35 @@
         </fieldset>
         <button class="btn primary big" type="submit">시작하기 · はじめる</button>
       </form>
+      <details class="code-login">
+        <summary>쓰던 계정 이어서 쓰기 · アカウントを引き継ぐ</summary>
+        <p class="muted small">Safari에 나온 6자리 코드를 입력하세요 · Safariに表示された6桁のコードを入力してください</p>
+        <form id="code-form" class="code-form" autocomplete="off">
+          <input id="code-input" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" placeholder="123456" required />
+          <button class="btn primary" type="submit">확인 · OK</button>
+        </form>
+      </details>
     </div>
   </section>
 
-  <!-- 2. Lobby ---------------------------------------------------------------->
-  <section id="screen-lobby" class="screen">
+  <!-- 2. Home: my rooms, invite, people online -------------------------------->
+  <section id="screen-home" class="screen">
     <header class="topbar">
       <div class="brand-mini"><span class="logo">💬</span> KoJa Talk</div>
       <div class="me-chip" id="me-chip"></div>
     </header>
     <div id="mock-banner" class="banner" hidden data-i18n="mockMode"></div>
     <main class="lobby">
+      <div id="app-card" class="card app-card" hidden>
+        <h2 id="app-card-title"></h2>
+        <div id="app-card-body" class="muted"></div>
+        <div id="app-card-actions" class="app-card-actions"></div>
+      </div>
+      <div class="card rooms-card">
+        <h2 data-i18n="myRooms"></h2>
+        <ul id="room-list" class="room-list"></ul>
+        <p id="rooms-empty" class="muted empty" data-i18n="noRooms"></p>
+      </div>
       <div class="card invite-card">
         <h2 data-i18n="inviteTitle"></h2>
         <p class="muted" data-i18n="inviteDesc"></p>
@@ -54,10 +79,7 @@
             <button id="copy-btn" class="btn primary" data-i18n="copy"></button>
             <button id="share-btn" class="btn" data-i18n="share" hidden></button>
           </div>
-          <div class="link-wait">
-            <p id="link-status" class="muted small"></p>
-            <button id="wait-btn" class="btn"></button>
-          </div>
+          <p class="muted small" data-i18n="linkWaiting"></p>
         </div>
       </div>
       <div class="card match-card">
@@ -78,7 +100,7 @@
   <!-- 3. Room: chat + call ------------------------------------------------------>
   <section id="screen-room" class="screen">
     <header class="topbar room-bar">
-      <button id="leave-btn" class="btn ghost" data-i18n="leave"></button>
+      <button id="leave-btn" class="btn ghost" data-i18n="back"></button>
       <div class="partner" id="partner-info"></div>
       <button id="call-btn" class="btn primary call-btn">📞 <span data-i18n="voiceCall"></span></button>
     </header>

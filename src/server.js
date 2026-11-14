@@ -1,175 +1,204 @@
 import express from "express";
 import http from "node:http";
 import path from "node:path";
-import { randomUUID, randomInt } from "node:crypto";
+import { randomUUID, randomInt, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import { translate, translatorInfo, LANGS } from "./translator.js";
 import { iceServers, turnInfo } from "./ice.js";
 import { openStream, sttInfo, sttEnabled } from "./stt.js";
+import { openStore } from "./store.js";
+import { initPush, pushTo, vapidPublicKey } from "./push.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
-// How long a user (and their room) survives a dropped connection — e.g. a phone switching networks or a locked screen.
-const GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 60_000;
+const RING_MS = 45_000; // how long a call rings (incl. waiting for a friend to open the app from a notification)
+const OFFLINE_DEBOUNCE_MS = 5_000; // short network blips don't flip someone to "offline"
+
+const store = await openStore();
+await initPush(store);
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 64 * 1024 });
 
+// The service worker must never be served stale, or app updates would not reach installed apps.
+app.get("/sw.js", (_req, res, next) => {
+  res.set("Cache-Control", "no-cache");
+  next();
+});
 app.use(express.static(path.join(here, "..", "public")));
 
 app.get("/api/config", async (_req, res) => {
-  res.json({ translator: translatorInfo.mode, stt: sttEnabled ? sttInfo.mode : null, iceServers: await iceServers() });
+  res.json({
+    translator: translatorInfo.mode,
+    stt: sttEnabled ? sttInfo.mode : null,
+    vapidPublicKey: vapidPublicKey(),
+    iceServers: await iceServers(),
+  });
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
+// Web app manifest. `t` carries a one-time token so the Home Screen app (which on iPhone has its own,
+// empty storage) can sign in as the same user it was installed from.
+app.get("/manifest.webmanifest", (req, res) => {
+  const t = /^[\w-]{16,64}$/.test(String(req.query.t ?? "")) ? `?t=${req.query.t}` : "";
+  res.type("application/manifest+json").send(
+    JSON.stringify({
+      name: "KoJa Talk · 코자톡 · コジャトーク",
+      short_name: "KoJa Talk",
+      description: "한국어 ↔ 日本語 번역 채팅 & 통화",
+      start_url: `/${t}`,
+      scope: "/",
+      display: "standalone",
+      background_color: "#f6f4f1",
+      theme_color: "#2f5bea",
+      icons: [
+        { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+        { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+        { src: "/icons/icon-512-maskable.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+      ],
+    }),
+  );
+});
+
 // ---------------------------------------------------------------------------
-// In-memory state (single server instance). Swap for Redis/DB when scaling out.
-//
-// Users are identified by a public id (shared with other users) and a private client id (cid) that
-// only their own browser tab knows. When a socket drops and reconnects, the cid lets the user take
-// their place back — same room, same partner — instead of starting over.
+// State. Users, rooms and messages live in the store (database). What follows is only who is connected.
 // ---------------------------------------------------------------------------
-/**
- * @typedef {{id: string, cid: string, name: string, lang: "ko"|"ja", roomId: string|null, matching: boolean,
- *            socketId: string|null, graceTimer: NodeJS.Timeout|null}} User
- */
-/** @type {Map<string, User>} public id -> user */
-const users = new Map();
-/** @type {Map<string, string>} cid -> public id */
-const byCid = new Map();
-/** @type {Map<string, string>} socket id -> public id */
-const bySocket = new Map();
-/** @type {Map<string, {id: string, code: string|null, members: string[], history: {speaker: string, text: string}[]}>} */
-const rooms = new Map();
-/** pending invites: inviterId -> targetId */
-const invites = new Map();
-/**
- * Room links: code -> id of the user waiting there. A code is permanent (the client keeps it), so the same
- * link works every time: whoever opens it first waits, the second person is connected to them.
- */
-const links = new Map();
+/** @type {Map<string, {userId: string, roomId: string|null, visible: boolean}>} socket id -> session */
+const sessions = new Map();
+/** @type {Map<string, Set<string>>} user id -> socket ids */
+const online = new Map();
+/** @type {Map<string, {id: string, name: string, lang: "ko"|"ja"}>} */
+const profiles = new Map();
+const lastSeen = new Map();
+const offlineTimers = new Map();
+const invites = new Map(); // inviterId -> targetId
+const matching = new Set(); // user ids looking for a random partner
+/** @type {Map<string, {roomId: string, from: string, to: string, timer: NodeJS.Timeout, delivered: Set<string>}>} */
+const pendingCalls = new Map(); // roomId -> ringing call
+const roomCache = new Map(); // roomId -> {id, members}
+
 const LINK_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const isCode = (c) => typeof c === "string" && /^[a-z0-9]{6}$/.test(c);
-function newLinkCode() {
-  let code;
-  do code = Array.from({ length: 6 }, () => LINK_ALPHABET[randomInt(LINK_ALPHABET.length)]).join("");
-  while (links.has(code));
-  return code;
-}
-function dropLinksOf(userId) {
-  for (const [code, uid] of links) if (uid === userId) links.delete(code);
-}
-const HISTORY_LINES = 6;
-
+const newCode = () => Array.from({ length: 6 }, () => LINK_ALPHABET[randomInt(LINK_ALPHABET.length)]).join("");
 const userRoom = (id) => `u:${id}`;
 const toUser = (id) => io.to(userRoom(id));
-const toRoom = (room) => io.to(room.members.map(userRoom));
-const publicUser = (u) => ({ id: u.id, name: u.name, lang: u.lang, busy: Boolean(u.roomId) });
-const other = (lang) => (lang === "ko" ? "ja" : "ko");
+const toMembers = (room) => io.to(room.members.map(userRoom));
+const clean = (v, max) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 
+const isOnline = (uid) => (online.get(uid)?.size ?? 0) > 0;
+const userSessions = (uid) => [...(online.get(uid) ?? [])].map((sid) => sessions.get(sid)).filter(Boolean);
+const isVisible = (uid) => userSessions(uid).some((s) => s.visible);
+const isViewing = (uid, roomId) => userSessions(uid).some((s) => s.visible && s.roomId === roomId);
+const presenceOf = (uid) => ({ online: isOnline(uid), lastSeen: lastSeen.get(uid) ?? null });
+
+const PUSH_TEXT = {
+  ko: { incoming: "전화가 왔어요 · 눌러서 받기", missed: "부재중 전화", joined: (n) => `${n}님이 대화방에 들어왔어요` },
+  ja: { incoming: "着信中 · タップして応答", missed: "不在着信", joined: (n) => `${n}さんがルームに入りました` },
+};
+
+async function getProfile(uid) {
+  if (!profiles.has(uid)) {
+    const u = await store.getUser(uid);
+    if (u) profiles.set(uid, u);
+  }
+  return profiles.get(uid) ?? null;
+}
+
+async function getRoom(id) {
+  if (!roomCache.has(id)) {
+    const r = await store.getRoom(id);
+    if (!r) return null;
+    roomCache.set(id, r);
+  }
+  return roomCache.get(id);
+}
+async function memberRoom(uid, roomId) {
+  if (!uid || typeof roomId !== "string") return null;
+  const r = await getRoom(roomId);
+  return r?.members.includes(uid) ? r : null;
+}
+const partnerIdOf = (room, uid) => room.members.find((m) => m !== uid) ?? null;
+
+async function createRoom(memberIds, code = null) {
+  for (let i = 0; i < 10; i++) {
+    const r = await store.createRoom(code ?? newCode(), memberIds);
+    if (r) {
+      roomCache.set(r.id, r);
+      return r;
+    }
+    if (code) return null; // that code is taken
+  }
+  throw new Error("could not create a room");
+}
+
+async function findOrCreatePairRoom(a, b) {
+  const existing = (await store.roomsOf(a)).find((r) => r.members.length === 2 && r.members.includes(b));
+  return existing ?? createRoom([a, b]);
+}
+
+async function roomSummary(room, uid) {
+  const pid = partnerIdOf(room, uid);
+  const partner = pid ? await getProfile(pid) : null;
+  const [last] = await store.recentMessages(room.id, 1);
+  return {
+    id: room.id,
+    partner: partner ? { ...partner, ...presenceOf(pid) } : null,
+    last: last ? { text: last.from === uid ? last.text : last.translation || last.text, ts: last.ts, mine: last.from === uid, kind: last.kind } : null,
+    unread: await store.unread(room.id, uid),
+  };
+}
+async function sendSummaries(room) {
+  await Promise.all(room.members.map(async (m) => toUser(m).emit("room:summary", await roomSummary(room, m))));
+}
+
+const publicUser = (p) => ({ id: p.id, name: p.name, lang: p.lang, busy: false });
 function broadcastUsers() {
-  const list = [...users.values()].filter((u) => u.socketId).map(publicUser);
+  const list = [...online.keys()].map((uid) => profiles.get(uid)).filter(Boolean).map(publicUser);
   io.to("lobby").emit("users:update", list);
 }
 
-function partnerOf(userId) {
-  const u = users.get(userId);
-  const room = u?.roomId && rooms.get(u.roomId);
-  if (!room) return null;
-  const pid = room.members.find((m) => m !== userId);
-  return pid ? users.get(pid) ?? null : null;
-}
-
-function createRoom(aId, bId, code = null) {
-  const a = users.get(aId);
-  const b = users.get(bId);
-  if (!a || !b || a.id === b.id || a.roomId || b.roomId) return null;
-  const room = { id: randomUUID(), code, members: [aId, bId], history: [] };
-  rooms.set(room.id, room);
-  for (const [me, partner] of [[a, b], [b, a]]) {
-    me.roomId = room.id;
-    me.matching = false;
-    invites.delete(me.id);
-    dropLinksOf(me.id);
-    toUser(me.id).emit("room:joined", { roomId: room.id, code, partner: publicUser(partner) });
+async function notifyPresence(uid) {
+  const rooms = await store.roomsOf(uid).catch(() => []);
+  for (const r of rooms) {
+    const pid = partnerIdOf(r, uid);
+    if (pid) toUser(pid).emit("presence", { userId: uid, ...presenceOf(uid) });
   }
-  broadcastUsers();
-  return room;
 }
 
-function leaveRoom(userId, reason = "left") {
-  const u = users.get(userId);
-  if (!u?.roomId) return;
-  const room = rooms.get(u.roomId);
-  u.roomId = null;
-  if (room) {
-    for (const mid of room.members) {
-      if (mid === userId) continue;
-      const m = users.get(mid);
-      if (m) m.roomId = null;
-      toUser(mid).emit("room:partner-left", { reason });
-    }
-    rooms.delete(room.id);
+// ---- Calls that ring while the friend is away --------------------------------------------------------
+function deliverPendingCalls(uid, socket) {
+  const s = sessions.get(socket.id);
+  if (!s?.visible) return;
+  for (const call of pendingCalls.values()) {
+    if (call.to !== uid || call.delivered.has(socket.id)) continue;
+    call.delivered.add(socket.id);
+    socket.emit("call:request", { roomId: call.roomId, from: call.from });
   }
-  broadcastUsers();
 }
 
-function removeUser(userId) {
-  const u = users.get(userId);
-  if (!u) return;
-  clearTimeout(u.graceTimer);
-  leaveRoom(userId, "disconnected");
-  const targetId = invites.get(userId);
-  if (targetId) toUser(targetId).emit("invite:cancelled", { from: userId });
-  invites.delete(userId);
-  dropLinksOf(userId);
-  users.delete(userId);
-  byCid.delete(u.cid);
-  broadcastUsers();
+function clearPendingCall(roomId) {
+  const call = pendingCalls.get(roomId);
+  if (call) clearTimeout(call.timer);
+  pendingCalls.delete(roomId);
+  return call;
 }
 
-function tryMatch(userId) {
-  const me = users.get(userId);
-  if (!me || me.roomId) return false;
-  const candidate = [...users.values()].find(
-    (u) => u.id !== me.id && u.matching && u.socketId && !u.roomId && u.lang === other(me.lang),
-  );
-  if (!candidate) return false;
-  createRoom(candidate.id, me.id);
-  return true;
+async function pushMissedCall(call) {
+  const caller = await getProfile(call.from);
+  const callee = await getProfile(call.to);
+  if (!caller || !callee || isVisible(call.to)) return;
+  await pushTo(call.to, {
+    kind: "missed",
+    title: `📞 ${caller.name}`,
+    body: PUSH_TEXT[callee.lang].missed,
+    tag: `call-${call.roomId}`,
+    url: `/?open=${call.roomId}`,
+  });
 }
 
-/** Enter a room link: wait there, or connect to whoever is already waiting. */
-function enterLink(me, code) {
-  if (me.roomId) return { ok: false, error: "busy" };
-  const waiter = users.get(links.get(code));
-  if (!waiter || waiter.id === me.id) {
-    dropLinksOf(me.id);
-    links.set(code, me.id);
-    return { ok: true, code, waiting: true };
-  }
-  if (waiter.roomId) return { ok: false, error: "busy" };
-  links.delete(code);
-  createRoom(waiter.id, me.id, code);
-  return { ok: true, code, waiting: false };
-}
-
-// Lets the invite page greet the friend ("민수 is waiting") and preselect their language.
-app.get("/api/link/:code", (req, res) => {
-  const code = String(req.params.code).toLowerCase();
-  if (!isCode(code)) return res.status(404).json({ ok: false });
-  const host = users.get(links.get(code));
-  res.json({ ok: true, host: host ? { name: host.name, lang: host.lang } : null });
-});
-
-function remember(room, speaker, text) {
-  room.history.push({ speaker, text });
-  if (room.history.length > HISTORY_LINES) room.history.shift();
-}
-
-// Simple per-user rate limit for translation requests: 20 per 10 seconds.
+// ---- Translation pipeline (chat messages and call captions) ---------------------------------------
 function makeLimiter(limit = 20, windowMs = 10_000) {
   let stamps = [];
   return () => {
@@ -181,241 +210,438 @@ function makeLimiter(limit = 20, windowMs = 10_000) {
   };
 }
 const limiters = new Map();
-const allow = (userId) => {
-  if (!limiters.has(userId)) limiters.set(userId, makeLimiter());
-  return limiters.get(userId)();
+const allow = (uid) => {
+  if (!limiters.has(uid)) limiters.set(uid, makeLimiter());
+  return limiters.get(uid)();
 };
 
-const clean = (v, max) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+async function postMessage(uid, roomId, text, kind) {
+  const room = await memberRoom(uid, roomId);
+  const me = await getProfile(uid);
+  const pid = room && partnerIdOf(room, uid);
+  const partner = pid && (await getProfile(pid));
+  const body = clean(text, kind === "chat" ? 1000 : 500);
+  if (!room || !me || !partner || !body) return { ok: false, error: partner ? "invalid" : "alone" };
+  if (!allow(uid)) return { ok: false, error: "rate_limited" };
 
-function speechInterim(u, text) {
-  const partner = u && partnerOf(u.id);
-  if (partner) toUser(partner.id).emit("speech:interim", { text: clean(text, 300) });
+  const context = (await store.recentMessages(room.id, 6)).map((m) => ({ speaker: m.name, text: m.text }));
+  const msg = { id: randomUUID(), roomId: room.id, from: uid, name: me.name, lang: me.lang, kind, text: body, ts: Date.now() };
+  await store.addMessage(msg);
+  toMembers(room).emit(kind === "chat" ? "chat:message" : "caption", msg);
+  if (isViewing(pid, room.id)) await store.setLastRead(room.id, pid, msg.ts);
+
+  (async () => {
+    const result = await translate(body, me.lang, partner.lang, context);
+    await store.updateMessage(room.id, msg.id, { translation: result.text, tlang: partner.lang, ok: result.ok, error: result.error });
+    toMembers(room).emit(kind === "chat" ? "chat:translation" : "caption:translation", { roomId: room.id, id: msg.id, lang: partner.lang, ...result });
+    if (kind !== "chat") return;
+    await sendSummaries(room);
+    if (!isViewing(pid, room.id)) {
+      await pushTo(pid, {
+        kind: "message",
+        title: me.name,
+        body: result.ok && result.text ? `${result.text}\n${body}` : body,
+        tag: `msg-${room.id}`,
+        url: `/?open=${room.id}`,
+      });
+    }
+  })().catch((e) => console.error("[message] translate/notify failed:", e.message));
+
+  return { ok: true, id: msg.id };
 }
 
-async function speechFinal(u, text) {
-  const partner = u && partnerOf(u.id);
-  const body = clean(text, 500);
-  if (!u || !partner || !body) return;
-  if (!allow(u.id)) return;
-
-  const room = rooms.get(u.roomId);
-  const caption = { id: randomUUID(), from: u.id, name: u.name, lang: u.lang, text: body, ts: Date.now() };
-  toRoom(room).emit("caption", caption);
-
-  const context = [...room.history];
-  remember(room, u.name, body);
-  const result = await translate(body, u.lang, partner.lang, context);
-  toRoom(room).emit("caption:translation", { id: caption.id, lang: partner.lang, ...result });
-}
+// ---------------------------------------------------------------------------
+// Invite page: greet the friend by the host's name and preselect their language.
+// ---------------------------------------------------------------------------
+app.get("/api/link/:code", async (req, res) => {
+  const code = String(req.params.code).toLowerCase();
+  if (!isCode(code)) return res.status(404).json({ ok: false });
+  const room = await getRoom(code).catch(() => null);
+  const host = room ? await getProfile(room.members[0]) : null;
+  res.json({ ok: true, host: host ? { name: host.name, lang: host.lang } : null, full: (room?.members.length ?? 0) >= 2 });
+});
 
 io.on("connection", (socket) => {
-  const me = () => users.get(bySocket.get(socket.id));
-
-  socket.on("profile:set", ({ name, lang, cid } = {}, ack) => {
-    const nick = clean(name, 24);
-    if (!nick || !LANGS[lang]) return ack?.({ ok: false, error: "invalid_profile" });
-    const clientId = typeof cid === "string" && /^[\w-]{16,64}$/.test(cid) ? cid : randomUUID();
-
-    let user = users.get(byCid.get(clientId));
-    const resumed = Boolean(user);
-    if (user) {
-      clearTimeout(user.graceTimer);
-      user.graceTimer = null;
-      // The same tab reconnected on a new socket: the old one (if still around) no longer speaks for this user.
-      if (user.socketId && user.socketId !== socket.id) {
-        bySocket.delete(user.socketId);
-        io.sockets.sockets.get(user.socketId)?.leave(userRoom(user.id));
-      }
-      user.name = nick;
-      user.lang = lang;
-    } else {
-      user = { id: randomUUID(), cid: clientId, name: nick, lang, roomId: null, matching: false, socketId: null, graceTimer: null };
-      users.set(user.id, user);
-      byCid.set(clientId, user.id);
+  const uid = () => sessions.get(socket.id)?.userId ?? null;
+  const safe = (fn) => async (...args) => {
+    try {
+      await fn(...args);
+    } catch (e) {
+      console.error("[socket] handler failed:", e.message);
+      const ack = args.find((a) => typeof a === "function");
+      ack?.({ ok: false, error: "server" });
     }
-    const wasOffline = !user.socketId;
-    user.socketId = socket.id;
-    bySocket.set(socket.id, user.id);
-    socket.join(["lobby", userRoom(user.id)]);
+  };
 
-    const partner = partnerOf(user.id);
-    if (partner && wasOffline) toUser(partner.id).emit("partner:status", { online: true });
-    const room = user.roomId ? rooms.get(user.roomId) : null;
-    ack?.({
-      ok: true,
-      resumed,
-      me: publicUser(user),
-      translator: translatorInfo.mode,
-      room: room && partner ? { roomId: room.id, code: room.code, partner: publicUser(partner) } : null,
-      waitingCode: [...links].find(([, uid]) => uid === user.id)?.[0] ?? null,
-    });
-    broadcastUsers();
+  function attach(user) {
+    const prev = sessions.get(socket.id);
+    sessions.set(socket.id, { userId: user.id, roomId: prev?.roomId ?? null, visible: prev?.visible ?? true });
+    profiles.set(user.id, user);
+    clearTimeout(offlineTimers.get(user.id));
+    offlineTimers.delete(user.id);
+    const wasOnline = isOnline(user.id);
+    if (!online.has(user.id)) online.set(user.id, new Set());
+    online.get(user.id).add(socket.id);
+    socket.join(["lobby", userRoom(user.id)]);
+    if (!wasOnline) notifyPresence(user.id);
+  }
+
+  // ---- Identity ----------------------------------------------------------------
+  // The browser keeps a secret key (localStorage); the server only stores its hash.
+  socket.on(
+    "hello",
+    safe(async ({ key, name, lang } = {}, ack) => {
+      const nick = clean(name, 24);
+      let user = typeof key === "string" && key.length >= 16 ? await store.userByKey(key) : null;
+      let issuedKey = null;
+      if (!user) {
+        if (!nick || !LANGS[lang]) return ack?.({ ok: false, needProfile: true });
+        ({ user, key: issuedKey } = await store.createUser({ name: nick, lang }));
+      } else if (nick && LANGS[lang] && (nick !== user.name || lang !== user.lang)) {
+        await store.updateUser(user.id, { name: nick, lang });
+        user = { ...user, name: nick, lang };
+      }
+      attach(user);
+      const rooms = await store.roomsOf(user.id);
+      ack?.({
+        ok: true,
+        me: user,
+        key: issuedKey,
+        rooms: await Promise.all(rooms.map((r) => roomSummary(r, user.id))),
+        translator: translatorInfo.mode,
+      });
+      broadcastUsers();
+      deliverPendingCalls(user.id, socket);
+    }),
+  );
+
+  socket.on("presence", ({ visible } = {}) => {
+    const s = sessions.get(socket.id);
+    if (!s) return;
+    s.visible = Boolean(visible);
+    if (s.visible) deliverPendingCalls(s.userId, socket);
   });
 
-  // ---- Invites & random matching -----------------------------------------
+  // Move the identity to the Home Screen app (separate storage on iPhone): a 6-digit code to type in,
+  // or a long token placed in the manifest's start_url.
+  socket.on(
+    "transfer:create",
+    safe(async ({ key } = {}, ack) => {
+      const me = uid();
+      const user = typeof key === "string" ? await store.userByKey(key) : null;
+      if (!me || user?.id !== me) return ack?.({ ok: false });
+      const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+      const token = randomBytes(18).toString("base64url");
+      const value = JSON.stringify({ key, expires: Date.now() + 24 * 3600_000 });
+      await store.setSetting(`transfer:${code}`, value);
+      await store.setSetting(`transfer:${token}`, value);
+      ack?.({ ok: true, code, token });
+    }),
+  );
+  let redeemTries = 0;
+  socket.on(
+    "transfer:redeem",
+    safe(async ({ code } = {}, ack) => {
+      if (++redeemTries > 8) return ack?.({ ok: false, error: "too_many" });
+      const id = String(code ?? "").trim();
+      if (!/^(\d{6}|[\w-]{16,64})$/.test(id)) return ack?.({ ok: false, error: "invalid" });
+      const raw = await store.getSetting(`transfer:${id}`);
+      const data = raw ? JSON.parse(raw) : null;
+      if (!data?.key || data.expires < Date.now()) return ack?.({ ok: false, error: "invalid" });
+      if (/^\d{6}$/.test(id)) await store.setSetting(`transfer:${id}`, "{}"); // short codes are single-use
+      ack?.({ ok: true, key: data.key });
+    }),
+  );
+
+  socket.on(
+    "push:subscribe",
+    safe(async ({ subscription } = {}, ack) => {
+      const me = uid();
+      if (!me || typeof subscription?.endpoint !== "string" || !/^https:\/\//.test(subscription.endpoint)) return ack?.({ ok: false });
+      await store.saveSubscription(me, { endpoint: subscription.endpoint, keys: subscription.keys ?? {} });
+      ack?.({ ok: true });
+    }),
+  );
+
+  // ---- Rooms -----------------------------------------------------------------------
+  socket.on(
+    "room:open",
+    safe(async ({ roomId } = {}, ack) => {
+      const me = uid();
+      const room = await memberRoom(me, roomId);
+      if (!room) return ack?.({ ok: false, error: "not_found" });
+      sessions.get(socket.id).roomId = room.id;
+      await store.setLastRead(room.id, me, Date.now());
+      const messages = await store.recentMessages(room.id, 100);
+      ack?.({ ok: true, room: await roomSummary(room, me), messages });
+      toUser(me).emit("room:summary", await roomSummary(room, me)); // clears the unread badge on other devices too
+      deliverPendingCalls(me, socket);
+    }),
+  );
+
+  socket.on("room:close", () => {
+    const s = sessions.get(socket.id);
+    if (s) s.roomId = null;
+  });
+
+  socket.on(
+    "room:read",
+    safe(async ({ roomId } = {}) => {
+      const me = uid();
+      if (await memberRoom(me, roomId)) await store.setLastRead(roomId, me, Date.now());
+    }),
+  );
+
+  // A new room link (one per friend). Reuses my room that is still waiting for someone, if any.
+  socket.on(
+    "link:create",
+    safe(async ({ code } = {}, ack) => {
+      const me = uid();
+      if (!me) return ack?.({ ok: false });
+      const wanted = String(code ?? "").toLowerCase();
+      if (isCode(wanted)) {
+        const room = (await getRoom(wanted)) ?? (await createRoom([me], wanted));
+        if (room?.members.includes(me)) return ack?.({ ok: true, roomId: room.id });
+      }
+      const waiting = (await store.roomsOf(me)).find((r) => r.members.length === 1);
+      const room = waiting ?? (await createRoom([me]));
+      toUser(me).emit("room:summary", await roomSummary(room, me));
+      ack?.({ ok: true, roomId: room.id });
+    }),
+  );
+
+  socket.on(
+    "link:join",
+    safe(async ({ code } = {}, ack) => {
+      const me = uid();
+      const key = String(code ?? "").toLowerCase();
+      if (!me) return ack?.({ ok: false, error: "no_profile" });
+      if (!isCode(key)) return ack?.({ ok: false, error: "expired" });
+      let room = await getRoom(key);
+      if (!room) {
+        // Unknown code (e.g. the data was reset): whoever opens it first owns it, like a fresh link.
+        room = await createRoom([me], key);
+        toUser(me).emit("room:summary", await roomSummary(room, me));
+        return ack?.({ ok: true, roomId: room.id, waiting: true });
+      }
+      if (room.members.includes(me)) return ack?.({ ok: true, roomId: room.id, waiting: room.members.length < 2 });
+      if (room.members.length >= 2) return ack?.({ ok: false, error: "full" });
+      await store.addMember(room.id, me);
+      room.members.push(me);
+      await sendSummaries(room);
+      const host = room.members[0];
+      const meProfile = await getProfile(me);
+      const hostProfile = await getProfile(host);
+      toUser(host).emit("room:joined-by", { roomId: room.id, user: publicUser(meProfile) });
+      if (hostProfile && !isVisible(host)) {
+        pushTo(host, { kind: "joined", title: "KoJa Talk", body: PUSH_TEXT[hostProfile.lang].joined(meProfile.name), tag: `room-${room.id}`, url: `/?open=${room.id}` });
+      }
+      ack?.({ ok: true, roomId: room.id, waiting: false });
+    }),
+  );
+
+  // ---- Lobby: invites & random matching (they create a lasting room too) -------------------------
+  async function startPair(a, b) {
+    const room = await findOrCreatePairRoom(a, b);
+    invites.delete(a);
+    invites.delete(b);
+    matching.delete(a);
+    matching.delete(b);
+    await sendSummaries(room);
+    toUser(a).emit("room:start", { roomId: room.id });
+    toUser(b).emit("room:start", { roomId: room.id });
+  }
+
   socket.on("invite:send", ({ to } = {}, ack) => {
-    const u = me();
-    const target = users.get(to);
-    if (!u || !target || target.id === u.id || !target.socketId) return ack?.({ ok: false, error: "not_found" });
-    if (u.roomId || target.roomId) return ack?.({ ok: false, error: "busy" });
-    invites.set(u.id, target.id);
-    toUser(target.id).emit("invite:received", { from: publicUser(u) });
+    const me = uid();
+    const target = profiles.get(to);
+    if (!me || !target || to === me || !isOnline(to)) return ack?.({ ok: false, error: "not_found" });
+    invites.set(me, to);
+    toUser(to).emit("invite:received", { from: publicUser(profiles.get(me)) });
     ack?.({ ok: true });
   });
-
   socket.on("invite:cancel", () => {
-    const u = me();
-    if (!u) return;
-    const targetId = invites.get(u.id);
-    invites.delete(u.id);
-    if (targetId) toUser(targetId).emit("invite:cancelled", { from: u.id });
+    const me = uid();
+    const to = invites.get(me);
+    invites.delete(me);
+    if (to) toUser(to).emit("invite:cancelled", { from: me });
   });
+  socket.on(
+    "invite:respond",
+    safe(async ({ from, accept } = {}) => {
+      const me = uid();
+      if (!me || invites.get(from) !== me) return;
+      invites.delete(from);
+      if (accept) await startPair(from, me);
+      else toUser(from).emit("invite:declined", { reason: "declined" });
+    }),
+  );
 
-  socket.on("invite:respond", ({ from, accept } = {}) => {
-    const u = me();
-    if (!u || invites.get(from) !== u.id) return;
-    invites.delete(from);
-    if (accept) {
-      if (!createRoom(from, u.id)) toUser(from).emit("invite:declined", { reason: "busy" });
-    } else {
-      toUser(from).emit("invite:declined", { reason: "declined" });
-    }
-  });
+  socket.on(
+    "match:find",
+    safe(async (_p, ack) => {
+      const me = uid();
+      const mine = profiles.get(me);
+      if (!mine) return ack?.({ ok: false });
+      const other = [...matching].find((u) => u !== me && isOnline(u) && profiles.get(u)?.lang !== mine.lang);
+      if (!other) {
+        matching.add(me);
+        return ack?.({ ok: true, matched: false });
+      }
+      ack?.({ ok: true, matched: true });
+      await startPair(other, me);
+    }),
+  );
+  socket.on("match:cancel", () => matching.delete(uid()));
 
-  socket.on("match:find", (_p, ack) => {
-    const u = me();
-    if (!u || u.roomId) return ack?.({ ok: false });
-    u.matching = true;
-    ack?.({ ok: true, matched: tryMatch(u.id) });
-  });
+  // ---- Chat ----------------------------------------------------------------------------
+  socket.on("chat:send", safe(async ({ roomId, text } = {}, ack) => ack?.(await postMessage(uid(), roomId, text, "chat"))));
 
-  socket.on("match:cancel", () => {
-    const u = me();
-    if (u) u.matching = false;
-  });
+  socket.on(
+    "chat:typing",
+    safe(async ({ roomId, typing } = {}) => {
+      const me = uid();
+      const room = await memberRoom(me, roomId);
+      const pid = room && partnerIdOf(room, me);
+      if (pid) toUser(pid).emit("chat:typing", { roomId, typing: Boolean(typing) });
+    }),
+  );
 
-  // ---- Room links ------------------------------------------------------------
-  // `code` is the client's saved code (so the link stays the same forever); a new one is made if absent.
-  socket.on("link:create", ({ code } = {}, ack) => {
-    const u = me();
-    if (!u) return ack?.({ ok: false });
-    const wanted = String(code ?? "").toLowerCase();
-    ack?.(enterLink(u, isCode(wanted) ? wanted : newLinkCode()));
-  });
-
-  socket.on("link:join", ({ code } = {}, ack) => {
-    const u = me();
-    const key = String(code ?? "").toLowerCase();
-    if (!u) return ack?.({ ok: false, error: "no_profile" });
-    if (!isCode(key)) return ack?.({ ok: false, error: "expired" });
-    ack?.(enterLink(u, key));
-  });
-
-  socket.on("link:cancel", () => {
-    const u = me();
-    if (u) dropLinksOf(u.id);
-  });
-
-  socket.on("room:leave", () => {
-    const u = me();
-    if (u) leaveRoom(u.id, "left");
-  });
-
-  // ---- Chat ----------------------------------------------------------------
-  socket.on("chat:send", async ({ text } = {}, ack) => {
-    const u = me();
-    const partner = u && partnerOf(u.id);
-    const body = clean(text, 1000);
-    if (!u || !partner || !body) return ack?.({ ok: false });
-    if (!allow(u.id)) return ack?.({ ok: false, error: "rate_limited" });
-
-    const room = rooms.get(u.roomId);
-    const msg = { id: randomUUID(), from: u.id, name: u.name, lang: u.lang, text: body, ts: Date.now() };
-    toRoom(room).emit("chat:message", msg);
-    ack?.({ ok: true, id: msg.id });
-
-    const context = [...room.history];
-    remember(room, u.name, body);
-    const result = await translate(body, u.lang, partner.lang, context);
-    toRoom(room).emit("chat:translation", { id: msg.id, lang: partner.lang, ...result });
-  });
-
-  socket.on("chat:typing", (typing) => {
-    const u = me();
-    const partner = u && partnerOf(u.id);
-    if (partner) toUser(partner.id).emit("chat:typing", Boolean(typing));
-  });
-
-  // ---- Call: live speech captions -------------------------------------------
-  // Text comes either from the browser's own speech recognition (speech:*) or from server-side STT (stt:*).
-  socket.on("speech:interim", ({ text } = {}) => speechInterim(me(), text));
-  socket.on("speech:final", ({ text } = {}) => speechFinal(me(), text));
+  // ---- Call captions -----------------------------------------------------------------------
+  // Text comes from the browser's own speech recognition (speech:*) or from server-side STT (stt:*).
+  async function speechInterim(me, roomId, text) {
+    const room = await memberRoom(me, roomId);
+    const pid = room && partnerIdOf(room, me);
+    if (pid) toUser(pid).emit("speech:interim", { roomId, text: clean(text, 300) });
+  }
+  socket.on("speech:interim", safe(({ roomId, text } = {}) => speechInterim(uid(), roomId, text)));
+  socket.on("speech:final", safe(({ roomId, text } = {}) => postMessage(uid(), roomId, text, "caption")));
 
   let stt = null;
   const stopStt = () => {
     stt?.close();
     stt = null;
   };
-  socket.on("stt:start", (_p, ack) => {
-    const u = me();
-    if (!u || !partnerOf(u.id)) return ack?.({ ok: false, error: "no_room" });
-    stopStt();
-    const userId = u.id;
-    stt = openStream({
-      lang: u.lang,
-      onInterim: (text) => {
-        socket.emit("stt:interim", { text });
-        speechInterim(users.get(userId), text);
-      },
-      onFinal: (text) => speechFinal(users.get(userId), text),
-      onError: (error) => {
-        stt = null;
-        socket.emit("stt:error", { error });
-      },
-    });
-    ack?.(stt ? { ok: true } : { ok: false, error: "unavailable" });
-  });
+  socket.on(
+    "stt:start",
+    safe(async ({ roomId } = {}, ack) => {
+      const me = uid();
+      const room = await memberRoom(me, roomId);
+      if (!room || !partnerIdOf(room, me)) return ack?.({ ok: false, error: "no_room" });
+      stopStt();
+      stt = openStream({
+        lang: profiles.get(me).lang,
+        onInterim: (text) => {
+          socket.emit("stt:interim", { text });
+          speechInterim(me, room.id, text).catch(() => {});
+        },
+        onFinal: (text) => postMessage(me, room.id, text, "caption").catch((e) => console.error("[stt] caption failed:", e.message)),
+        onError: (error) => {
+          stt = null;
+          socket.emit("stt:error", { error });
+        },
+      });
+      ack?.(stt ? { ok: true } : { ok: false, error: "unavailable" });
+    }),
+  );
   socket.on("stt:audio", (chunk) => {
     if (stt && Buffer.isBuffer(chunk) && chunk.length <= 16_000) stt.write(chunk);
   });
   socket.on("stt:stop", stopStt);
 
-  // ---- Call: signaling (WebRTC media flows peer-to-peer) ---------------------
-  const relay = (event) =>
-    socket.on(event, (payload = {}) => {
-      const u = me();
-      const partner = u && partnerOf(u.id);
-      if (partner) toUser(partner.id).emit(event, payload);
-    });
-  ["call:request", "call:accept", "call:decline", "call:cancel", "call:end", "rtc:signal"].forEach(relay);
+  // ---- Call signaling (WebRTC media flows peer-to-peer) ---------------------------------------
+  for (const event of ["call:request", "call:accept", "call:decline", "call:cancel", "call:end", "rtc:signal"]) {
+    socket.on(
+      event,
+      safe(async (payload = {}) => {
+        const me = uid();
+        const room = await memberRoom(me, payload.roomId);
+        const pid = room && partnerIdOf(room, me);
+        if (!pid) return;
+        const out = { ...payload, roomId: room.id, from: me };
+
+        if (event === "call:request") {
+          clearPendingCall(room.id);
+          const call = {
+            roomId: room.id,
+            from: me,
+            to: pid,
+            delivered: new Set(),
+            timer: setTimeout(() => {
+              pendingCalls.delete(room.id);
+              toUser(me).emit("call:no-answer", { roomId: room.id });
+              toUser(pid).emit("call:cancel", { roomId: room.id, from: me });
+              pushMissedCall(call).catch(() => {});
+            }, RING_MS),
+          };
+          pendingCalls.set(room.id, call);
+          for (const sid of online.get(pid) ?? []) {
+            if (sessions.get(sid)?.visible) {
+              call.delivered.add(sid);
+              io.to(sid).emit("call:request", out);
+            }
+          }
+          if (!isVisible(pid)) {
+            const caller = profiles.get(me);
+            const callee = await getProfile(pid);
+            const sent = await pushTo(pid, {
+              kind: "call",
+              title: `📞 ${caller.name}`,
+              body: PUSH_TEXT[callee?.lang ?? "ko"].incoming,
+              tag: `call-${room.id}`,
+              url: `/?open=${room.id}&call=1`,
+              ttl: Math.ceil(RING_MS / 1000),
+            });
+            socket.emit("call:ringing", { roomId: room.id, notified: sent > 0 });
+          }
+          return;
+        }
+
+        if (event === "call:cancel") {
+          const call = clearPendingCall(room.id);
+          if (call) pushMissedCall(call).catch(() => {});
+        } else if (event !== "rtc:signal") {
+          clearPendingCall(room.id);
+        }
+        toUser(pid).emit(event, out);
+        // Answered or declined on one device: stop it ringing on my other devices.
+        if (event === "call:accept" || event === "call:decline") socket.to(userRoom(me)).emit("call:cancel", { roomId: room.id, from: pid });
+      }),
+    );
+  }
 
   socket.on("disconnect", () => {
     stopStt();
-    const id = bySocket.get(socket.id);
-    bySocket.delete(socket.id);
-    const u = users.get(id);
-    if (!u || u.socketId !== socket.id) return; // already taken over by a newer socket
-    u.socketId = null;
-    u.matching = false;
-    const targetId = invites.get(u.id);
-    if (targetId) toUser(targetId).emit("invite:cancelled", { from: u.id });
-    invites.delete(u.id);
-    const partner = partnerOf(u.id);
-    if (partner) toUser(partner.id).emit("partner:status", { online: false });
+    const me = uid();
+    sessions.delete(socket.id);
+    if (!me) return;
+    const set = online.get(me);
+    set?.delete(socket.id);
+    if (set?.size) return;
+    online.delete(me);
+    matching.delete(me);
+    const to = invites.get(me);
+    if (to) toUser(to).emit("invite:cancelled", { from: me });
+    invites.delete(me);
     broadcastUsers();
-    // Keep the seat warm for a while; if they don't come back, clean up for real.
-    u.graceTimer = setTimeout(() => {
-      limiters.delete(u.id);
-      removeUser(u.id);
-    }, GRACE_MS);
+    offlineTimers.set(
+      me,
+      setTimeout(() => {
+        offlineTimers.delete(me);
+        if (isOnline(me)) return;
+        lastSeen.set(me, Date.now());
+        notifyPresence(me);
+      }, OFFLINE_DEBOUNCE_MS),
+    );
   });
 });
 
 server.listen(PORT, () => {
   const t = translatorInfo.mode === "mock" ? "mock (no API calls)" : `Claude (${translatorInfo.model})`;
   const s = sttEnabled ? `${sttInfo.mode}${sttInfo.mode === "deepgram" ? ` (${sttInfo.model})` : ""}` : "browser only (set DEEPGRAM_API_KEY for phones)";
-  console.log(`Language exchange server on http://localhost:${PORT}  ·  translator: ${t}  ·  speech-to-text: ${s}  ·  ICE: ${turnInfo()}`);
+  console.log(`Language exchange server on http://localhost:${PORT}`);
+  console.log(`  translator: ${t}  ·  speech-to-text: ${s}  ·  ICE: ${turnInfo()}`);
+  console.log(`  storage: ${store.kind === "postgres" ? "Postgres (DATABASE_URL)" : "memory — data is lost on restart (set DATABASE_URL)"}`);
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }

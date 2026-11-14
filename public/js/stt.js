@@ -30,18 +30,18 @@ export class ServerSTT {
     } catch {}
   }
 
-  /** @param {MediaStream} stream */
-  start(stream) {
+  /** @param {MediaStream} stream @param {string} roomId */
+  start(stream, roomId) {
     if (this.running) return Promise.resolve(true);
-    this.starting ??= this.#start(stream).finally(() => (this.starting = null));
+    this.starting ??= this.#start(stream, roomId).finally(() => (this.starting = null));
     return this.starting;
   }
 
-  async #start(stream) {
+  async #start(stream, roomId) {
     this.prime();
     if (!this.ctx?.audioWorklet) return false;
     const ok = await new Promise((resolve) =>
-      this.socket.timeout(5000).emit("stt:start", null, (err, res) => resolve(!err && res?.ok)),
+      this.socket.timeout(5000).emit("stt:start", { roomId }, (err, res) => resolve(!err && res?.ok)),
     );
     if (!ok) return false;
     try {

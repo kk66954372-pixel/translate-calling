@@ -12,34 +12,49 @@ export class Call extends EventTarget {
     this.isCaller = false;
     this.recoverTimer = null;
     this.recoverDeadline = null;
+    this.roomId = null;
     this.state = "idle"; // idle | outgoing | incoming | active
     this.pc = null;
     this.localStream = null;
     this.remoteStream = null;
     this.pendingCandidates = [];
 
-    socket.on("call:request", () => {
-      if (this.state !== "idle") return socket.emit("call:decline", { reason: "busy" });
+    // Every event carries the room it belongs to; events for another room are ignored.
+    const mine = (p) => p?.roomId === this.roomId;
+    socket.on("call:request", (p = {}) => {
+      if (this.state === "incoming" && mine(p)) return; // same call delivered twice (e.g. after reopening the app)
+      if (this.state !== "idle") return socket.emit("call:decline", { roomId: p.roomId, reason: "busy" });
+      this.roomId = p.roomId;
       this.state = "incoming";
-      this.emit("incoming");
+      this.emit("incoming", { roomId: p.roomId, from: p.from });
     });
-    socket.on("call:accept", () => this.#onAccepted());
-    socket.on("call:decline", () => {
-      if (this.state === "outgoing") this.#cleanup("declined");
+    socket.on("call:accept", (p) => mine(p) && this.#onAccepted());
+    socket.on("call:decline", (p) => {
+      if (mine(p) && this.state === "outgoing") this.#cleanup("declined");
     });
-    socket.on("call:cancel", () => {
-      if (this.state === "incoming") this.#cleanup("cancelled");
+    socket.on("call:cancel", (p) => {
+      if (mine(p) && this.state === "incoming") this.#cleanup("cancelled");
     });
-    socket.on("call:end", () => this.#cleanup("ended"));
-    socket.on("rtc:signal", (data) => this.#onSignal(data).catch((e) => console.error("signal error", e)));
+    socket.on("call:no-answer", (p) => {
+      if (mine(p) && this.state === "outgoing") this.#cleanup("no_answer");
+    });
+    socket.on("call:ringing", (p) => mine(p) && this.emit("ringing", { notified: p.notified }));
+    socket.on("call:end", (p) => mine(p) && this.#cleanup("ended"));
+    socket.on("rtc:signal", (data) => mine(data) && this.#onSignal(data).catch((e) => console.error("signal error", e)));
+  }
+
+  #send(event, data = {}) {
+    this.socket.emit(event, { ...data, roomId: this.roomId });
   }
 
   emit(type, detail) {
     this.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
-  async start() {
+  /** @param {string} roomId */
+  async start(roomId) {
     if (this.state !== "idle") return;
+    this.roomId = roomId;
     this.state = "outgoing";
     this.isCaller = true;
     try {
@@ -49,7 +64,7 @@ export class Call extends EventTarget {
       throw e;
     }
     this.emit("state", { state: this.state });
-    this.socket.emit("call:request");
+    this.#send("call:request");
   }
 
   async accept() {
@@ -58,25 +73,25 @@ export class Call extends EventTarget {
     try {
       await this.#prepare();
     } catch (e) {
-      this.socket.emit("call:decline", { reason: "media_error" });
+      this.#send("call:decline", { reason: "media_error" });
       this.#cleanup("media_error");
       throw e;
     }
     this.state = "active";
     this.#createPeer();
     this.emit("state", { state: this.state });
-    this.socket.emit("call:accept");
+    this.#send("call:accept");
   }
 
   decline() {
     if (this.state !== "incoming") return;
-    this.socket.emit("call:decline", { reason: "declined" });
+    this.#send("call:decline", { reason: "declined" });
     this.#cleanup("declined_by_me");
   }
 
   hangup() {
     if (this.state === "idle") return;
-    this.socket.emit(this.state === "outgoing" ? "call:cancel" : "call:end");
+    this.#send(this.state === "outgoing" ? "call:cancel" : "call:end");
     this.#cleanup("ended_by_me");
   }
 
@@ -101,7 +116,7 @@ export class Call extends EventTarget {
     if (Date.now() > this.recoverDeadline) return this.hangup();
     this.emit("connection", { state: "reconnecting" });
     if (this.isCaller) this.#sendOffer(true).catch((e) => console.warn("ice restart failed", e));
-    else this.socket.emit("rtc:signal", { type: "restart" });
+    else this.#send("rtc:signal", { type: "restart" });
     clearTimeout(this.recoverTimer);
     this.recoverTimer = setTimeout(() => this.recover(), 5000);
   }
@@ -136,7 +151,7 @@ export class Call extends EventTarget {
       if (!this.remoteStream.getTracks().includes(ev.track)) this.remoteStream.addTrack(ev.track);
     };
     pc.onicecandidate = (ev) => {
-      if (ev.candidate) this.socket.emit("rtc:signal", { type: "candidate", candidate: ev.candidate });
+      if (ev.candidate) this.#send("rtc:signal", { type: "candidate", candidate: ev.candidate });
     };
     pc.onconnectionstatechange = () => {
       const st = pc.connectionState;
@@ -164,7 +179,7 @@ export class Call extends EventTarget {
     if (!pc) return;
     const offer = await pc.createOffer({ iceRestart });
     await pc.setLocalDescription(offer);
-    this.socket.emit("rtc:signal", { type: "offer", sdp: pc.localDescription });
+    this.#send("rtc:signal", { type: "offer", sdp: pc.localDescription });
   }
 
   async #onSignal(data) {
@@ -177,7 +192,7 @@ export class Call extends EventTarget {
       await this.#flushCandidates();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      this.socket.emit("rtc:signal", { type: "answer", sdp: pc.localDescription });
+      this.#send("rtc:signal", { type: "answer", sdp: pc.localDescription });
     } else if (data.type === "answer") {
       await pc.setRemoteDescription(data.sdp);
       await this.#flushCandidates();
