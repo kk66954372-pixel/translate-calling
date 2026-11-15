@@ -624,6 +624,13 @@ server.listen(PORT, () => {
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }
+  // Fetch TURN credentials once at startup so a bad key shows up in the log right away.
+  if (turnInfo() === "Cloudflare TURN") {
+    iceServers().then((list) => {
+      const turn = list.filter((s) => s.urls.some((u) => u.startsWith("turn")));
+      console.log(turn.length ? `[ice] TURN ready (${turn.flatMap((s) => s.urls).length} relay addresses)` : "[ice] TURN not available, using STUN only");
+    });
+  }
   // One-off translation model comparison (results go to the log). Turn the variable off afterwards.
   if (process.env.TRANSLATION_COMPARE === "1") {
     import("./compare.js").then((m) => m.runCompare()).catch((e) => console.error("[compare] failed:", e.message));
