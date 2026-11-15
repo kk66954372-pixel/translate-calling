@@ -1,3 +1,5 @@
+import { VoiceGate } from "./vad.js";
+
 // Call captions via server-side speech recognition (works on phones).
 // The call's own microphone stream (already echo-cancelled for WebRTC) is converted to 16 kHz PCM
 // and streamed to the server, which forwards it to the speech-to-text service.
@@ -48,8 +50,11 @@ export class ServerSTT {
       await this.ctx.audioWorklet.addModule("/js/pcm-worklet.js");
       this.source = this.ctx.createMediaStreamSource(stream);
       this.node = new AudioWorkletNode(this.ctx, "pcm16k");
+      // Only speech (plus a little before and after) is sent: recognition is billed by the audio sent.
+      this.gate = new VoiceGate();
       this.node.port.onmessage = (e) => {
-        if (this.running && !this.h.shouldPause()) this.socket.emit("stt:audio", e.data);
+        if (!this.running || this.h.shouldPause()) return;
+        for (const chunk of this.gate.push(new Int16Array(e.data))) this.socket.emit("stt:audio", chunk.buffer);
       };
       // The worklet only runs while connected to the output; a muted gain keeps it silent.
       const mute = this.ctx.createGain();

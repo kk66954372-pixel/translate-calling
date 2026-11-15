@@ -54,6 +54,7 @@ class DeepgramStream {
     this.pending = []; // audio that arrived before the socket opened
     this.finals = []; // finished segments of the sentence being spoken
     this.lastAudio = Date.now();
+    this.finalized = true; // no audio since the last Finalize
     this.join = (parts) => {
       const text = parts.join(" ").trim();
       return h.lang === "ja" ? text.replace(CJK_GAP, "") : text;
@@ -72,7 +73,7 @@ class DeepgramStream {
       utterance_end_ms: "1200", // backup end-of-sentence signal for noisy audio
       vad_events: "true",
     });
-    this.ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
+    this.ws = new WebSocket(`${process.env.DEEPGRAM_URL || "wss://api.deepgram.com/v1/listen"}?${params}`, {
       headers: { Authorization: `Token ${KEY}` },
     });
     this.ws.on("open", () => {
@@ -99,18 +100,29 @@ class DeepgramStream {
       this.closed = true;
       clearInterval(this.keepAlive);
     });
-    // Deepgram closes a stream after ~10 s without data (e.g. while muted).
+    this.lastKeepAlive = 0;
     this.keepAlive = setInterval(() => {
-      if (Date.now() - this.lastAudio > 7000 && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ws.readyState !== WebSocket.OPEN) return;
+      const idle = Date.now() - this.lastAudio;
+      // The browser only sends audio while someone speaks. When it stops, ask Deepgram to finish the
+      // sentence now instead of waiting for more audio.
+      if (!this.finalized && idle > 1200) {
+        this.finalized = true;
+        this.ws.send(JSON.stringify({ type: "Finalize" }));
+      }
+      // Deepgram closes a stream after ~10 s without data (silence, or muted).
+      if (idle > 7000 && Date.now() - this.lastKeepAlive > 7000) {
+        this.lastKeepAlive = Date.now();
         this.ws.send(JSON.stringify({ type: "KeepAlive" }));
       }
-    }, 3000);
+    }, 500);
   }
 
   write(chunk) {
     if (this.closed) return;
     if (overDailyLimit()) return this.#fail("daily_limit");
     this.lastAudio = Date.now();
+    this.finalized = false;
     addUsage(chunk.length);
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(chunk);
     else if (this.ws.readyState === WebSocket.CONNECTING && this.pending.length < 50) this.pending.push(chunk);
@@ -139,7 +151,7 @@ class DeepgramStream {
     const text = msg.channel?.alternatives?.[0]?.transcript?.trim() ?? "";
     if (msg.is_final) {
       if (text) this.finals.push(text);
-      if (msg.speech_final) this.#flush();
+      if (msg.speech_final || msg.from_finalize) this.#flush();
       else if (this.finals.length) this.h.onInterim(this.join(this.finals));
     } else if (text) {
       this.h.onInterim(this.join([...this.finals, text]));
