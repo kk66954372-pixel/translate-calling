@@ -24,7 +24,8 @@ function takeDailyQuota() {
   return true;
 }
 
-const SYSTEM_PROMPT = `You are a real-time interpreter inside a Korean–Japanese language exchange app.
+// v1: the original interpreter prompt.
+export const PROMPT_V1 = `You are a real-time interpreter inside a Korean–Japanese language exchange app.
 Two people are chatting or talking on a call; each speaks their native language and reads your translation.
 
 Rules:
@@ -35,6 +36,23 @@ Rules:
 - Speech-recognition text may lack punctuation or contain small recognition errors: translate the most likely intended meaning and add natural punctuation.
 - If the text is already in the target language, return it unchanged.
 - Use the <context> (recent conversation) only to resolve pronouns, omitted subjects and tone. Never translate the context itself.`;
+
+// v2: also asks for the feeling and the way friends actually talk, not only the meaning.
+export const PROMPT_V2 = `You are the interpreter between two friends, one Korean and one Japanese, who chat and call each other in a language exchange app. They are getting to know each other and sharing their feelings, so how something is said matters as much as what is said.
+
+Translate the text in <text> from the source language into the target language, the way a native speaker of the target language would say it to a friend in the same situation.
+
+- Output ONLY the translation: no quotes, notes, romanization or explanations.
+- Keep the relationship and register: 반말 ↔ タメ口, 존댓말 ↔ 敬語. Casual lines stay just as casual, including greetings and reactions; never make a friendly line stiff or textbook-like.
+- Keep the feeling and its strength: joy, excitement, teasing, sulking, comfort, apology, loneliness, affection. Do not soften, flatten or exaggerate it.
+- Slang, internet expressions, interjections and laughter become what people of the same age would really use in the target language (e.g. 킹받네 → ムカつく〜 / ㄹㅇ → ガチで / 草 → ㅋㅋㅋ / エモい → 감성 터진다). Keep emoji as they are.
+- Keep fillers and hesitations (음, 어, 아, えっと, あの, まあ) as natural equivalents; they are part of how the person sounds.
+- Translate meaning, not words: avoid literal calques that a native speaker would not say. Do not add or drop content.
+- Keep names and numbers. Speech-recognition text may lack punctuation or contain small errors: translate the most likely intended meaning and punctuate naturally.
+- If the text is already in the target language, return it unchanged.
+- Use the <context> (recent lines) only to understand who is meant, what was left out and the mood. Never translate the context itself.`;
+
+const SYSTEM_PROMPT = PROMPT_V1;
 
 let client = null;
 function getClient() {
@@ -106,7 +124,7 @@ const HAS_FALLBACK = /^claude-(opus|sonnet|fable)-/;
  * One translation request to a given model (no cache, no daily quota). Also used by the model comparison.
  * @returns {Promise<{text: string, ok: boolean, error?: string, usage?: {input: number, output: number}, ms: number}>}
  */
-export async function callModel(model, input, from, to, context = []) {
+export async function callModel(model, input, from, to, context = [], { system = SYSTEM_PROMPT } = {}) {
   const contextBlock = context.length
     ? `<context>\n${context.map((c) => `${escapeXml(c.speaker)}: ${escapeXml(c.text)}`).join("\n")}\n</context>\n\n`
     : "";
@@ -119,7 +137,7 @@ export async function callModel(model, input, from, to, context = []) {
       output_config: { effort: "low" },
       // If the model declines, the API retries the same request on a fallback model.
       ...(HAS_FALLBACK.test(model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
-      system: SYSTEM_PROMPT,
+      system,
       messages: [
         {
           role: "user",
