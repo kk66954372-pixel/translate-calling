@@ -8,7 +8,12 @@ export const LANGS = {
   ja: { name: "Japanese", native: "日本語", speech: "ja-JP" },
 };
 
-const MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
+// Chat messages are read closely (and are few): a stronger model. Call captions are most of the volume and
+// flash by: a fast, inexpensive model. Chosen after comparing Opus / Sonnet / Haiku on 50 everyday and
+// emotional ko<->ja lines (src/compare.js).
+// Defaults keep the previous setup until the round-3 comparison is reviewed.
+const CHAT_MODEL = process.env.CHAT_MODEL || process.env.CLAUDE_MODEL || "claude-opus-5-5";
+const CAPTION_MODEL = process.env.CAPTION_MODEL || CHAT_MODEL;
 const MODE = (process.env.TRANSLATOR || "claude").toLowerCase();
 const MAX_INPUT_CHARS = 1000;
 // Cost guard: at most this many API calls per day (Korea/Japan date). 0 = unlimited.
@@ -69,7 +74,11 @@ const OUTPUT_FORMAT = {
   },
 };
 
-const SYSTEM_PROMPT = PROMPT_V1;
+const PROMPTS = { v1: PROMPT_V1, v2: PROMPT_V2, v3: PROMPT_V3 };
+const PROMPT_VERSION = PROMPTS[process.env.TRANSLATION_PROMPT] ? process.env.TRANSLATION_PROMPT : "v1";
+const SYSTEM_PROMPT = PROMPTS[PROMPT_VERSION];
+// v3 asks for {"translation": ...}; v1/v2 answer in plain text.
+const USE_JSON = PROMPT_VERSION === "v3";
 
 let client = null;
 function getClient() {
@@ -103,15 +112,16 @@ function escapeXml(s) {
  * @param {"ko"|"ja"} from
  * @param {"ko"|"ja"} to
  * @param {{speaker: string, text: string}[]} [context] recent lines of the conversation (oldest first)
+ * @param {{kind?: "chat"|"caption"}} [options]
  * @returns {Promise<{text: string, ok: boolean, error?: string}>}
  */
-export async function translate(text, from, to, context = []) {
+export async function translate(text, from, to, context = [], { kind = "chat" } = {}) {
   const input = String(text || "").trim().slice(0, MAX_INPUT_CHARS);
   if (!input) return { text: "", ok: true };
   if (from === to) return { text: input, ok: true };
 
   // Only cache context-free lookups for short phrases; longer lines depend on context.
-  const cacheKey = input.length <= 20 ? `${from}>${to}:${input}` : null;
+  const cacheKey = input.length <= 20 ? `${kind}:${from}>${to}:${input}` : null;
   if (cacheKey) {
     const hit = cacheGet(cacheKey);
     if (hit !== undefined) return { text: hit, ok: true };
@@ -129,7 +139,8 @@ export async function translate(text, from, to, context = []) {
     return { text: "", ok: false, error: "daily_limit" };
   }
 
-  const result = await callModel(MODEL, input, from, to, context);
+  const model = kind === "caption" ? CAPTION_MODEL : CHAT_MODEL;
+  const result = await callModel(model, input, from, to, context, { system: SYSTEM_PROMPT, json: USE_JSON });
   if (result.ok && cacheKey && result.text) cacheSet(cacheKey, result.text);
   return { text: result.text, ok: result.ok, ...(result.error ? { error: result.error } : {}) };
 }
@@ -195,4 +206,9 @@ export async function callModel(model, input, from, to, context = [], { system =
   }
 }
 
-export const translatorInfo = { mode: MODE, model: MODE === "mock" ? null : MODEL, dailyLimit: DAILY_LIMIT, usage };
+export const translatorInfo = {
+  mode: MODE,
+  model: MODE === "mock" ? null : `chat ${CHAT_MODEL}, captions ${CAPTION_MODEL}, prompt ${PROMPT_VERSION}`,
+  dailyLimit: DAILY_LIMIT,
+  usage,
+};

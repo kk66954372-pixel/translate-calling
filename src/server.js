@@ -231,7 +231,7 @@ async function postMessage(uid, roomId, text, kind) {
   if (isViewing(pid, room.id)) await store.setLastRead(room.id, pid, msg.ts);
 
   (async () => {
-    const result = await translate(body, me.lang, partner.lang, context);
+    const result = await translate(body, me.lang, partner.lang, context, { kind });
     await store.updateMessage(room.id, msg.id, { translation: result.text, tlang: partner.lang, ok: result.ok, error: result.error });
     toMembers(room).emit(kind === "chat" ? "chat:translation" : "caption:translation", { roomId: room.id, id: msg.id, lang: partner.lang, ...result });
     if (kind !== "chat") return;
