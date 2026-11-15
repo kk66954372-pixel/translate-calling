@@ -31,7 +31,7 @@
 - [ ] **3. Cloudflare TURN 키 만들기** (다른 나라/모바일 데이터 간 통화 연결용, 월 1,000GB 무료)
       dash.cloudflare.com → Realtime → TURN Server → Create → 나오는 `Key ID`와 `API Token`을 Render에 `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` 으로 추가
 - [x] **4. Deepgram 가입 + API 키** (B안) — console.deepgram.com → API Keys → Render에 `DEEPGRAM_API_KEY` 추가
-- [ ] **5. 무료 데이터베이스(Neon) 만들기** — 계정·대화방·대화 기록 저장용. 없으면 서버가 잠들 때마다(15분) 전부 사라짐
+- [x] **5. 무료 데이터베이스(Neon) 만들기** — 계정·대화방·대화 기록 저장용. 없으면 서버가 잠들 때마다(15분) 전부 사라짐
       neon.tech → 가입 → 프로젝트 생성(지역: Singapore) → Connect → 연결 문자열 복사 → Render에 `DATABASE_URL` 로 추가
 - [ ] **6. (권장) 서버 잠들지 않게 하기** — cron-job.org 무료 가입 → `https://koja-talk.onrender.com/healthz` 를 10분마다 호출
 - [ ] **7. 둘 다 아이폰에 앱 설치 + 알림 켜기** — Safari로 열기 → 공유 → 홈 화면에 추가 → 홈 화면 앱 열기 → 알림 켜기
