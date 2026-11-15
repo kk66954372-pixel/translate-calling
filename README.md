@@ -23,7 +23,7 @@
 | 내 말 확인 | 통화 화면 아래에 "나: 내가 한 말 → 상대에게 보인 번역"이 표시돼서, 내 말이 일본어로 어떻게 전달됐는지 배울 수 있습니다. |
 | 통화 기록 | 통화 중 문장도 채팅창에 원문+번역으로 남아 나중에 복습할 수 있습니다. |
 
-번역은 Claude API(`claude-opus-5-5`)를 사용합니다. 최근 대화 몇 줄을 문맥으로 함께 보내서 생략된 주어, 반말/존댓말·タメ口/敬語 같은 말투를 유지하도록 했습니다.
+번역은 Claude API(`claude-sonnet-5-5`)를 사용합니다. 여러 모델을 일상·감정 문장으로 비교해 고른 설정입니다(`src/compare.js`). 최근 대화 몇 줄을 문맥으로 함께 보내서 생략된 주어, 반말/존댓말·タメ口/敬語 같은 말투를 유지하도록 했습니다.
 
 ## 실행하기
 
@@ -54,7 +54,10 @@ npm run dev:mock
 | `DEEPGRAM_MODEL` | `nova-3` | Deepgram 모델 |
 | `DAILY_STT_MINUTES` | `600` | 하루 최대 음성 인식 분량(분). `0`이면 무제한 |
 | `TRANSLATOR` | `claude` | `mock` 으로 두면 API 호출 없이 동작 |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | 번역에 쓸 모델 |
+| `CHAT_MODEL` | `claude-sonnet-5-5` | 채팅 메시지 번역 모델 (`CLAUDE_MODEL` 도 인식) |
+| `CAPTION_MODEL` | `CHAT_MODEL` 과 같음 | 통화 자막 번역 모델 |
+| `TRANSLATION_PROMPT` | `v3` | 번역 지시문 버전 (`v1`/`v2`/`v3`, `src/translator.js`) |
+| `TRANSLATION_COMPARE` | – | `1` 이면 서버 시작 시 번역 모델 비교(`src/compare.js`)를 한 번 실행해 결과를 로그에 남김 |
 | `PORT` | `3000` | 서버 포트 |
 | `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` | – | Cloudflare TURN 키. 있으면 통화마다 임시 TURN 자격증명을 발급합니다 (월 1,000GB 무료). **모바일 데이터·다른 나라 간 통화에 권장** |
 | `ICE_SERVERS` | Google STUN | 다른 TURN 서비스를 쓸 때 ICE 서버 JSON. 예: `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |

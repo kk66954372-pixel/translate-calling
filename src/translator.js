@@ -11,8 +11,10 @@ export const LANGS = {
 // Chat messages are read closely (and are few): a stronger model. Call captions are most of the volume and
 // flash by: a fast, inexpensive model. Chosen after comparing Opus / Sonnet / Haiku on 50 everyday and
 // emotional ko<->ja lines (src/compare.js).
-// Defaults keep the previous setup until the round-3 comparison is reviewed.
-const CHAT_MODEL = process.env.CHAT_MODEL || process.env.CLAUDE_MODEL || "claude-opus-5-5";
+// Sonnet for both chat and call captions: in testing it carried feelings and register best, and Haiku
+// occasionally added content that was not said (e.g. an "I hate you" that the speaker never said), which is
+// not acceptable for an app about getting close to someone. CAPTION_MODEL can still point captions elsewhere.
+const CHAT_MODEL = process.env.CHAT_MODEL || process.env.CLAUDE_MODEL || "claude-sonnet-5-5";
 const CAPTION_MODEL = process.env.CAPTION_MODEL || CHAT_MODEL;
 const MODE = (process.env.TRANSLATOR || "claude").toLowerCase();
 const MAX_INPUT_CHARS = 1000;
@@ -75,7 +77,7 @@ const OUTPUT_FORMAT = {
 };
 
 const PROMPTS = { v1: PROMPT_V1, v2: PROMPT_V2, v3: PROMPT_V3 };
-const PROMPT_VERSION = PROMPTS[process.env.TRANSLATION_PROMPT] ? process.env.TRANSLATION_PROMPT : "v1";
+const PROMPT_VERSION = PROMPTS[process.env.TRANSLATION_PROMPT] ? process.env.TRANSLATION_PROMPT : "v3";
 const SYSTEM_PROMPT = PROMPTS[PROMPT_VERSION];
 // v3 asks for {"translation": ...}; v1/v2 answer in plain text.
 const USE_JSON = PROMPT_VERSION === "v3";
@@ -165,7 +167,8 @@ export async function callModel(model, input, from, to, context = [], { system =
       output_config: { effort: "low", ...(json ? { format: OUTPUT_FORMAT } : {}) },
       // If the model declines, the API retries the same request on a fallback model.
       ...(HAS_FALLBACK.test(model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
-      system,
+      // The instructions are the same on every request: cache them (reads cost 5-10% of normal input).
+      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
       messages: [
         {
           role: "user",
@@ -176,7 +179,12 @@ export async function callModel(model, input, from, to, context = [], { system =
       ],
     });
     const ms = Date.now() - started;
-    const usage = { input: response.usage?.input_tokens ?? 0, output: response.usage?.output_tokens ?? 0 };
+    const usage = {
+      input: response.usage?.input_tokens ?? 0,
+      output: response.usage?.output_tokens ?? 0,
+      cacheRead: response.usage?.cache_read_input_tokens ?? 0,
+      cacheWrite: response.usage?.cache_creation_input_tokens ?? 0,
+    };
 
     if (response.stop_reason === "refusal") return { text: "", ok: false, error: "refusal", usage, ms };
 

@@ -3,19 +3,17 @@
 // one JSON line per result, prefixed with "[compare]", to the log.
 import { callModel, PROMPT_V3 } from "./translator.js";
 
-// $ per million tokens (input, output). Output includes thinking tokens.
+// $ per million tokens: [input, output, cache-read multiplier]. Output includes thinking tokens;
+// cache writes (5-minute) cost 1.25x input.
 const PRICES = {
-  "claude-opus-5-5": [4, 20],
-  "claude-sonnet-5-5": [2, 10],
-  "claude-haiku-5-5": [0.1, 0.5],
+  "claude-opus-5-5": [4, 20, 0.05],
+  "claude-sonnet-5-5": [2, 10, 0.05],
+  "claude-haiku-5-5": [0.1, 0.5, 0.1],
 };
 
-// Model + prompt combinations to compare. Round 3: prompt v3 with translation-only JSON output, the exact
-// setup the app is about to use (Sonnet for chat, Haiku for call captions).
-const CONFIGS = [
-  { label: "sonnet-v3", model: "claude-sonnet-5-5", system: PROMPT_V3, json: true },
-  { label: "haiku-v3", model: "claude-haiku-5-5", system: PROMPT_V3, json: true },
-];
+// Model + prompt combinations to compare. Round 4: the production setup (Sonnet, prompt v3, JSON output)
+// with the instructions cached, to measure cache hits and the real cost per line.
+const CONFIGS = [{ label: "sonnet-v3-cached", model: "claude-sonnet-5-5", system: PROMPT_V3, json: true }];
 
 const ctx = (speaker, text) => [{ speaker, text }];
 
@@ -81,14 +79,15 @@ export async function runCompare() {
   for (const [i, c] of CASES.entries()) {
     const to = c.from === "ko" ? "ja" : "ko";
     for (const { label, model, system, json } of CONFIGS) {
-      const [pin, pout] = PRICES[model];
+      const [pin, pout, readMul] = PRICES[model];
       const r = await callModel(model, c.text, c.from, to, c.context ?? [], { system, json });
-      const cost = r.usage ? (r.usage.input * pin + r.usage.output * pout) / 1e6 : 0;
+      const u = r.usage;
+      const cost = u ? (u.input * pin + u.cacheRead * pin * readMul + u.cacheWrite * pin * 1.25 + u.output * pout) / 1e6 : 0;
       const t = totals[label];
       Object.assign(t, { ms: t.ms + r.ms, cost: t.cost + cost, ok: t.ok + (r.ok ? 1 : 0), n: t.n + 1 });
       console.log(
         "[compare] " +
-          JSON.stringify({ i, cfg: label, src: c.text, out: r.text, ok: r.ok, error: r.error, ms: r.ms, outTok: r.usage?.output, cost: Number(cost.toFixed(6)) }),
+          JSON.stringify({ i, cfg: label, src: c.text, out: r.text, ok: r.ok, error: r.error, ms: r.ms, in: u?.input, cacheRead: u?.cacheRead, cacheWrite: u?.cacheWrite, outTok: u?.output, cost: Number(cost.toFixed(6)) }),
       );
     }
   }
