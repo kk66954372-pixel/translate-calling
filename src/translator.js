@@ -52,6 +52,23 @@ Translate the text in <text> from the source language into the target language, 
 - If the text is already in the target language, return it unchanged.
 - Use the <context> (recent lines) only to understand who is meant, what was left out and the mood. Never translate the context itself.`;
 
+// v3: v2 plus two rules found in testing (pronouns that sound rude or distant; laughter/crying marks).
+export const PROMPT_V3 = `${PROMPT_V2}
+- Pronouns: Japanese usually leaves "you" out; between friends use 君 or the person's name if one is needed, and never お前, あんた or あなた unless the source is just as rough or distant. In Korean, friends say 너 (or nothing), never 당신.
+- Laughter and crying marks become the target language's own (ㅋㅋ, ㅎㅎ, ㅠㅠ ↔ w, 笑, 泣, (泣)); never leave the other language's marks untranslated.
+- Put the translation, and nothing else, in the "translation" field.`;
+
+// The answer comes back as {"translation": "..."} so that nothing but the translation can reach the screen.
+const OUTPUT_FORMAT = {
+  type: "json_schema",
+  schema: {
+    type: "object",
+    properties: { translation: { type: "string" } },
+    required: ["translation"],
+    additionalProperties: false,
+  },
+};
+
 const SYSTEM_PROMPT = PROMPT_V1;
 
 let client = null;
@@ -124,7 +141,7 @@ const HAS_FALLBACK = /^claude-(opus|sonnet|fable)-/;
  * One translation request to a given model (no cache, no daily quota). Also used by the model comparison.
  * @returns {Promise<{text: string, ok: boolean, error?: string, usage?: {input: number, output: number}, ms: number}>}
  */
-export async function callModel(model, input, from, to, context = [], { system = SYSTEM_PROMPT } = {}) {
+export async function callModel(model, input, from, to, context = [], { system = SYSTEM_PROMPT, json = false } = {}) {
   const contextBlock = context.length
     ? `<context>\n${context.map((c) => `${escapeXml(c.speaker)}: ${escapeXml(c.text)}`).join("\n")}\n</context>\n\n`
     : "";
@@ -134,7 +151,7 @@ export async function callModel(model, input, from, to, context = [], { system =
       model,
       max_tokens: 4000,
       // Translation is latency-sensitive and simple: keep effort low.
-      output_config: { effort: "low" },
+      output_config: { effort: "low", ...(json ? { format: OUTPUT_FORMAT } : {}) },
       // If the model declines, the API retries the same request on a fallback model.
       ...(HAS_FALLBACK.test(model) ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}),
       system,
@@ -152,11 +169,18 @@ export async function callModel(model, input, from, to, context = [], { system =
 
     if (response.stop_reason === "refusal") return { text: "", ok: false, error: "refusal", usage, ms };
 
-    const out = response.content
+    let out = response.content
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("")
       .trim();
+    if (json) {
+      try {
+        out = String(JSON.parse(out).translation ?? "").trim();
+      } catch {
+        return { text: "", ok: false, error: "bad_output", usage, ms };
+      }
+    }
     return { text: out, ok: true, usage, ms };
   } catch (error) {
     let reason = "unknown";

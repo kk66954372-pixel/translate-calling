@@ -1,7 +1,7 @@
 // Translation model comparison: the same sentences through several Claude models, with latency and cost.
 // Runs once at server start when TRANSLATION_COMPARE=1 (so it uses the server's API key), and prints
 // one JSON line per result, prefixed with "[compare]", to the log.
-import { callModel, PROMPT_V1, PROMPT_V2 } from "./translator.js";
+import { callModel, PROMPT_V3 } from "./translator.js";
 
 // $ per million tokens (input, output). Output includes thinking tokens.
 const PRICES = {
@@ -10,11 +10,11 @@ const PRICES = {
   "claude-haiku-5-5": [0.1, 0.5],
 };
 
-// Model + prompt combinations to compare (round 2: is a tuned Haiku close to Sonnet on feelings and tone?).
+// Model + prompt combinations to compare. Round 3: prompt v3 with translation-only JSON output, the exact
+// setup the app is about to use (Sonnet for chat, Haiku for call captions).
 const CONFIGS = [
-  { label: "sonnet-v2", model: "claude-sonnet-5-5", system: PROMPT_V2 },
-  { label: "haiku-v1", model: "claude-haiku-5-5", system: PROMPT_V1 },
-  { label: "haiku-v2", model: "claude-haiku-5-5", system: PROMPT_V2 },
+  { label: "sonnet-v3", model: "claude-sonnet-5-5", system: PROMPT_V3, json: true },
+  { label: "haiku-v3", model: "claude-haiku-5-5", system: PROMPT_V3, json: true },
 ];
 
 const ctx = (speaker, text) => [{ speaker, text }];
@@ -80,9 +80,9 @@ export async function runCompare() {
   const totals = Object.fromEntries(CONFIGS.map((c) => [c.label, { ms: 0, cost: 0, ok: 0, n: 0 }]));
   for (const [i, c] of CASES.entries()) {
     const to = c.from === "ko" ? "ja" : "ko";
-    for (const { label, model, system } of CONFIGS) {
+    for (const { label, model, system, json } of CONFIGS) {
       const [pin, pout] = PRICES[model];
-      const r = await callModel(model, c.text, c.from, to, c.context ?? [], { system });
+      const r = await callModel(model, c.text, c.from, to, c.context ?? [], { system, json });
       const cost = r.usage ? (r.usage.input * pin + r.usage.output * pout) / 1e6 : 0;
       const t = totals[label];
       Object.assign(t, { ms: t.ms + r.ms, cost: t.cost + cost, ok: t.ok + (r.ok ? 1 : 0), n: t.n + 1 });
