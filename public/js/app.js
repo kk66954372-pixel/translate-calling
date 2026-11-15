@@ -17,7 +17,6 @@ const state = {
   translator: "claude",
   stt: null,
   vapid: null,
-  matching: false,
   modal: null, // { kind, data }
   mic: true,
 };
@@ -393,7 +392,6 @@ socket.on("room:joined-by", ({ roomId, user }) => {
 
 socket.on("room:start", ({ roomId }) => {
   closeModal();
-  setMatching(false);
   openRoom(roomId);
 });
 
@@ -498,7 +496,7 @@ function requestTransferCode() {
   });
 }
 
-// ---- People online, invites, random matching ----------------------------------------------------
+// ---- People online, invites -------------------------------------------------------------------------
 socket.on("users:update", (list) => {
   state.users = list;
   renderUsers();
@@ -559,21 +557,6 @@ socket.on("invite:declined", () => {
   closeModal("outgoing-invite");
   toast(T.declined);
 });
-
-$("#match-btn").addEventListener("click", () => {
-  if (state.matching) return setMatching(false, true);
-  setMatching(true);
-  socket.emit("match:find", null, (res) => {
-    if (!res?.ok || res.matched) setMatching(false);
-  });
-});
-
-function setMatching(on, notify = false) {
-  state.matching = on;
-  if (!on && notify) socket.emit("match:cancel");
-  $(".match-card").classList.toggle("finding", on);
-  $("#match-btn").textContent = on ? `${T.finding} ✕` : T.findPartner;
-}
 
 // ---------------------------------------------------------------------------
 // Room: chat history + live chat

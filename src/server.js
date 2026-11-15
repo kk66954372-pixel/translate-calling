@@ -74,7 +74,6 @@ const profiles = new Map();
 const lastSeen = new Map();
 const offlineTimers = new Map();
 const invites = new Map(); // inviterId -> targetId
-const matching = new Set(); // user ids looking for a random partner
 /** @type {Map<string, {roomId: string, from: string, to: string, timer: NodeJS.Timeout, delivered: Set<string>}>} */
 const pendingCalls = new Map(); // roomId -> ringing call
 const roomCache = new Map(); // roomId -> {id, members}
@@ -440,13 +439,11 @@ io.on("connection", (socket) => {
     }),
   );
 
-  // ---- Lobby: invites & random matching (they create a lasting room too) -------------------------
+  // ---- Lobby: invites from the online list (they create a lasting room too) ----------------------
   async function startPair(a, b) {
     const room = await findOrCreatePairRoom(a, b);
     invites.delete(a);
     invites.delete(b);
-    matching.delete(a);
-    matching.delete(b);
     await sendSummaries(room);
     toUser(a).emit("room:start", { roomId: room.id });
     toUser(b).emit("room:start", { roomId: room.id });
@@ -476,23 +473,6 @@ io.on("connection", (socket) => {
       else toUser(from).emit("invite:declined", { reason: "declined" });
     }),
   );
-
-  socket.on(
-    "match:find",
-    safe(async (_p, ack) => {
-      const me = uid();
-      const mine = profiles.get(me);
-      if (!mine) return ack?.({ ok: false });
-      const other = [...matching].find((u) => u !== me && isOnline(u) && profiles.get(u)?.lang !== mine.lang);
-      if (!other) {
-        matching.add(me);
-        return ack?.({ ok: true, matched: false });
-      }
-      ack?.({ ok: true, matched: true });
-      await startPair(other, me);
-    }),
-  );
-  socket.on("match:cancel", () => matching.delete(uid()));
 
   // ---- Chat ----------------------------------------------------------------------------
   socket.on("chat:send", safe(async ({ roomId, text } = {}, ack) => ack?.(await postMessage(uid(), roomId, text, "chat"))));
@@ -619,7 +599,6 @@ io.on("connection", (socket) => {
     set?.delete(socket.id);
     if (set?.size) return;
     online.delete(me);
-    matching.delete(me);
     const to = invites.get(me);
     if (to) toUser(to).emit("invite:cancelled", { from: me });
     invites.delete(me);
