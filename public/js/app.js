@@ -17,6 +17,9 @@ const state = {
   translator: "claude",
   stt: null,
   vapid: null,
+  auth: { email: false, google: false },
+  googleClientId: null,
+  account: null, // {email, google} of the signed-in user
   modal: null, // { kind, data }
   mic: true,
 };
@@ -47,6 +50,8 @@ const params = new URLSearchParams(location.search);
 let pendingJoin = params.get("room");
 let pendingOpen = params.get("open");
 let pendingToken = params.get("t");
+let pendingTicket = params.get("gticket"); // back from Google sign-in (redirect mode)
+const loginFailed = params.get("login") === "failed";
 if ([...params.keys()].length) history.replaceState(null, "", location.pathname);
 
 // ---------------------------------------------------------------------------
@@ -182,14 +187,210 @@ fetch("/api/config")
   .then((c) => {
     state.stt = c.stt ?? null;
     state.vapid = c.vapidPublicKey ?? null;
+    state.auth = c.auth ?? state.auth;
+    state.googleClientId = c.googleClientId ?? null;
     renderAppCard();
+    renderLoginOptions();
+    initGoogle();
   })
   .catch(() => {});
+if (loginFailed) setTimeout(() => toast(`⚠️ ${both("loginFailed")}`, 5000), 500);
 
 const getIceServers = () =>
   fetch("/api/config")
     .then((r) => r.json())
     .then((c) => c.iceServers);
+
+// ---------------------------------------------------------------------------
+// Accounts: sign in / link with an email code or Google
+// ---------------------------------------------------------------------------
+const both = (k) => `${STRINGS.ko[k]} · ${STRINGS.ja[k]}`;
+const onSetup = () => $("#screen-setup").classList.contains("active");
+const authText = (k, ...a) => {
+  if (!onSetup()) return typeof T[k] === "function" ? T[k](...a) : T[k];
+  const ko = STRINGS.ko[k];
+  const ja = STRINGS.ja[k];
+  return typeof ko === "function" ? `${ko(...a)} · ${ja(...a)}` : `${ko} · ${ja}`;
+};
+const authError = (code) => {
+  if (onSetup()) return `${STRINGS.ko.authErrors[code] ?? STRINGS.ko.loginFailed} · ${STRINGS.ja.authErrors[code] ?? STRINGS.ja.loginFailed}`;
+  return T.authErrors[code] ?? T.loginFailed;
+};
+
+/** Nickname and language from the setup form, used when signing in creates a new account. */
+function setupProfile() {
+  const draft = load("draft", null);
+  const name = $("#nickname").value.trim() || draft?.name || "";
+  const lang = document.querySelector("input[name=lang]:checked")?.value || draft?.lang || "ko";
+  return { name, lang };
+}
+// Remember what was typed: Google's redirect flow reloads the page.
+$("#setup-form").addEventListener("input", () => save("draft", setupProfile()));
+
+function afterSignIn(res) {
+  if (!res?.ok) {
+    if (res?.error === "need_profile") $("#nickname").focus();
+    return toast(`⚠️ ${authError(res?.error)}`, 5000);
+  }
+  if (res.key) {
+    save("key", res.key);
+    save("draft", null);
+    hello();
+    setTimeout(() => toast(`✅ ${T.signedIn}`), 600);
+  } else if (res.linked) {
+    state.account = res.account ?? state.account;
+    renderAccount();
+    toast(`✅ ${T.linkedToast}`);
+  }
+}
+
+function renderLoginOptions() {
+  const any = state.auth.email || state.auth.google;
+  $("#login-setup").hidden = !any;
+  $("#email-open-setup").hidden = !state.auth.email;
+  $("#email-open-home").hidden = !state.auth.email;
+}
+
+function renderAccount() {
+  const card = $("#account-card");
+  if (!state.me || !(state.auth.email || state.auth.google)) return (card.hidden = true);
+  card.hidden = false;
+  const linked = state.account && (state.account.email || state.account.google);
+  $("#account-title").textContent = linked ? T.accountTitle : T.accountTitleLink;
+  $("#account-desc").textContent = linked
+    ? state.account.email
+      ? T.accountLinkedEmail(state.account.email)
+      : T.accountLinkedGoogle
+    : T.accountDescLink;
+  $("#account-actions").hidden = Boolean(linked);
+  $("#email-open-home").textContent = T.continueEmail;
+  $("#logout-btn").hidden = !linked;
+  $("#logout-btn").textContent = T.logout;
+  if (!linked) renderGoogleButtons();
+}
+
+$("#logout-btn").addEventListener("click", () => {
+  openModal("logout", T.logoutConfirm, [
+    { label: T.cancel },
+    {
+      label: T.logout,
+      cls: "primary",
+      onClick: () => {
+        socket.emit("auth:logout", { key: load("key", null) }, () => {
+          ["key", "profile", "draft", "roomCode"].forEach((k) => save(k, null));
+          location.href = "/";
+        });
+      },
+    },
+  ]);
+});
+
+// Email: type the address → get a 6-digit code → type the code.
+function mountEmailBox(box) {
+  box.hidden = false;
+  box.replaceChildren();
+  const row = document.createElement("div");
+  row.className = "row";
+  const input = Object.assign(document.createElement("input"), { type: "email", autocomplete: "email", inputMode: "email", placeholder: authText("emailPh") });
+  input.value = load("lastEmail", "") || "";
+  const send = Object.assign(document.createElement("button"), { type: "button", className: "btn primary", textContent: authText("sendCode") });
+  row.append(input, send);
+  box.append(row);
+  input.focus();
+
+  const requestCode = (email) =>
+    new Promise((resolve) => {
+      send.disabled = true;
+      socket.emit("auth:email:start", { email }, (res) => {
+        send.disabled = false;
+        if (!res?.ok) toast(`⚠️ ${authError(res?.error)}`, 5000);
+        resolve(res?.ok ? res.email : null);
+      });
+    });
+
+  send.onclick = async () => {
+    const email = await requestCode(input.value);
+    if (!email) return;
+    save("lastEmail", email);
+    showCodeStep(email);
+  };
+  input.onkeydown = (e) => e.key === "Enter" && send.click();
+
+  function showCodeStep(email) {
+    box.replaceChildren();
+    const hint = Object.assign(document.createElement("p"), { className: "hint", textContent: authText("codeSentTo", email) });
+    const row2 = document.createElement("div");
+    row2.className = "row";
+    const code = Object.assign(document.createElement("input"), {
+      className: "code",
+      inputMode: "numeric",
+      autocomplete: "one-time-code",
+      maxLength: 6,
+      placeholder: "000000",
+    });
+    const ok = Object.assign(document.createElement("button"), { type: "button", className: "btn primary", textContent: authText("verify") });
+    row2.append(code, ok);
+    const links = document.createElement("div");
+    links.className = "links";
+    const again = Object.assign(document.createElement("button"), { type: "button", textContent: authText("resendCode") });
+    const change = Object.assign(document.createElement("button"), { type: "button", textContent: authText("changeEmail") });
+    links.append(again, change);
+    box.append(hint, row2, links);
+    code.focus();
+
+    ok.onclick = () => {
+      ok.disabled = true;
+      const profile = onSetup() ? setupProfile() : {};
+      socket.emit("auth:email:verify", { email, code: code.value, ...profile }, (res) => {
+        ok.disabled = false;
+        if (res?.ok) box.hidden = true;
+        afterSignIn(res);
+      });
+    };
+    code.oninput = () => code.value.replace(/\D/g, "").length === 6 && ok.click();
+    again.onclick = () => requestCode(email);
+    change.onclick = () => mountEmailBox(box);
+  }
+}
+$("#email-open-setup").addEventListener("click", () => mountEmailBox($("#email-box-setup")));
+$("#email-open-home").addEventListener("click", () => mountEmailBox($("#email-box-home")));
+
+// Google: "Sign in with Google" button. Popup normally; redirect in the iPhone Home Screen app,
+// where popups are unreliable (the server then hands back a one-time ticket).
+let googleReady = false;
+function initGoogle() {
+  if (!state.googleClientId || googleReady || document.querySelector("#gsi-script")) return;
+  const script = Object.assign(document.createElement("script"), { id: "gsi-script", src: "https://accounts.google.com/gsi/client", async: true });
+  script.onload = () => {
+    const redirect = pwa.isIOS && pwa.isStandalone;
+    window.google.accounts.id.initialize({
+      client_id: state.googleClientId,
+      callback: (r) => socket.emit("auth:google", { credential: r.credential, ...(onSetup() ? setupProfile() : {}) }, afterSignIn),
+      ux_mode: redirect ? "redirect" : "popup",
+      login_uri: `${location.origin}/auth/google/callback`,
+      auto_select: false,
+      itp_support: true,
+    });
+    googleReady = true;
+    renderGoogleButtons();
+  };
+  document.head.append(script);
+}
+function renderGoogleButtons() {
+  if (!googleReady) return;
+  for (const id of ["#g-btn-setup", "#g-btn-home"]) {
+    const el = $(id);
+    if (el.childElementCount) continue;
+    window.google.accounts.id.renderButton(el, {
+      theme: "outline",
+      size: "large",
+      shape: "pill",
+      text: "continue_with",
+      width: 280,
+      locale: state.me?.lang ?? "ko",
+    });
+  }
+}
 
 $("#setup-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -221,6 +422,12 @@ function redeem(code, typed = false) {
 function hello() {
   const key = load("key", null);
   const profile = load("profile", null);
+  if (!key && pendingTicket) {
+    // Back from Google with no account on this device yet: sign in (or create one from the setup form).
+    const ticket = pendingTicket;
+    pendingTicket = null;
+    return socket.emit("auth:google", { ticket, ...setupProfile() }, afterSignIn);
+  }
   if (!key && pendingToken) {
     const token = pendingToken;
     pendingToken = null;
@@ -245,7 +452,15 @@ function hello() {
     renderMe();
     renderRooms();
     renderAppCard();
+    state.account = res.account ?? null;
+    renderAccount();
     $("#mock-banner").hidden = state.translator !== "mock";
+    if (pendingTicket) {
+      // Back from Google while signed in: link Google to this account (or switch to the Google account).
+      const ticket = pendingTicket;
+      pendingTicket = null;
+      socket.emit("auth:google", { ticket }, afterSignIn);
+    }
     sendPresence();
     pwa.subscribePush(state.vapid).then(sendSubscription).catch(() => {});
     if (reconnect) setOffline(false);

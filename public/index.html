@@ -40,6 +40,13 @@
         </fieldset>
         <button class="btn primary big" type="submit">시작하기 · はじめる</button>
       </form>
+      <div id="login-setup" class="login-block" hidden>
+        <div class="divider"><span>또는 · または</span></div>
+        <div id="g-btn-setup" class="g-btn"></div>
+        <button id="email-open-setup" class="btn big" type="button" hidden>✉️ 이메일로 계속하기 · メールで続ける</button>
+        <div id="email-box-setup" class="email-box" hidden></div>
+        <p class="muted small center">계정이 있으면 바로 로그인돼요 · アカウントがあればそのままログインします</p>
+      </div>
       <details class="code-login">
         <summary>쓰던 계정 이어서 쓰기 · アカウントを引き継ぐ</summary>
         <p class="muted small">Safari에 나온 6자리 코드를 입력하세요 · Safariに表示された6桁のコードを入力してください</p>
@@ -63,6 +70,16 @@
         <h2 id="app-card-title"></h2>
         <div id="app-card-body" class="muted"></div>
         <div id="app-card-actions" class="app-card-actions"></div>
+      </div>
+      <div id="account-card" class="card account-card" hidden>
+        <h2 id="account-title"></h2>
+        <p id="account-desc" class="muted"></p>
+        <div id="account-actions" class="login-block">
+          <div id="g-btn-home" class="g-btn"></div>
+          <button id="email-open-home" class="btn" type="button" hidden></button>
+          <div id="email-box-home" class="email-box" hidden></div>
+        </div>
+        <button id="logout-btn" class="btn ghost small-btn" type="button" hidden></button>
       </div>
       <div class="card rooms-card">
         <h2 data-i18n="myRooms"></h2>

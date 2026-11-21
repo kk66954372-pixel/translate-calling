@@ -10,6 +10,7 @@
 |---|---|
 | 프로필 | 닉네임 + 모국어(한국어/日本語) 선택. UI가 내 언어로 표시됩니다. |
 | 홈 화면 앱 | 아이폰 Safari → 공유 → **홈 화면에 추가**하면 앱처럼 열립니다 (Android/PC는 "설치" 버튼). 앱을 닫아 두어도 **새 메시지·전화 알림**이 옵니다 (iOS 16.4+). |
+| 계정 | Google 또는 이메일 인증 코드로 로그인. 폰을 바꿔도 같은 계정으로 대화방이 그대로. 로그인하기 전 쓰던 대화방은 계정으로 합쳐짐 |
 | 대화방 | 카톡처럼 대화방이 계속 유지됩니다. 대화 기록(채팅·통화 자막)이 저장되고, 안 읽은 메시지 수와 상대의 접속 상태("온라인", "3분 전 접속")가 보입니다. |
 | 부재 중 전화 | 상대가 앱 밖에 있으면 알림으로 전화를 알리고, 상대가 앱을 열면 바로 울립니다 (45초). 받지 못하면 "부재중 전화" 알림. |
 | 고정 방 링크 | 로비에서 "초대 링크 만들기" → 카톡/LINE으로 친구에게 전송. **같은 링크를 계속 사용**합니다. 먼저 들어온 사람이 기다리고, 나중에 들어온 사람과 바로 연결됩니다. 친구 화면에는 "○○さんが待っています"가 뜨고 일본어가 미리 선택됩니다. |
@@ -48,6 +49,11 @@ npm run dev:mock
 |---|---|---|
 | `ANTHROPIC_API_KEY` | – | Claude API 키 (번역) |
 | `DATABASE_URL` | – | Postgres 연결 문자열 (예: Neon 무료). **배포 시 필수** — 없으면 계정·대화방·기록이 메모리에만 있어 서버가 재시작/잠들면 사라짐 |
+| `GOOGLE_CLIENT_ID` | – | "Google로 계속하기" 로그인용 OAuth 클라이언트 ID (Google Cloud 콘솔, 웹 애플리케이션) |
+| `BREVO_API_KEY` | – | 이메일 인증 코드 발송 (Brevo, 하루 300통 무료). Render 무료 플랜은 SMTP가 막혀 있어 HTTP API를 사용 |
+| `EMAIL_FROM` | – | 보내는 사람, 예: `KoJa Talk <me@gmail.com>` (Brevo에서 인증한 주소) |
+| `RESEND_API_KEY` | – | Brevo 대신 Resend 사용 시 (본인 도메인 필요) |
+| `MAIL` | – | `log` 면 메일 대신 서버 로그에 코드 출력 (개발·테스트용) |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | 자동 생성 | 푸시 알림 서버 키. 비워 두면 처음 시작할 때 만들어 DB에 저장 |
 | `DEEPGRAM_API_KEY` | – | Deepgram API 키 (통화 음성 인식). 있으면 서버 음성 인식을 사용해 휴대폰에서도 자막이 동작 |
 | `STT` | 키가 있으면 `deepgram`, 없으면 `off` | `mock` 은 테스트용 가짜 음성 인식, `off` 는 브라우저 음성 인식만 사용 |
@@ -81,6 +87,8 @@ src/ice.js          WebRTC ICE/TURN 서버 설정 (Cloudflare TURN 임시 자격
 src/stt.js          서버 음성 인식 (Deepgram 실시간 스트리밍, mock)
 src/store.js        저장소: 사용자·대화방·메시지·푸시 구독 (Postgres 또는 메모리)
 src/push.js         Web Push 알림 (VAPID)
+src/auth.js         로그인: 이메일 코드, Google ID 토큰 확인, 리디렉션 티켓
+src/mail.js         인증 메일 발송 (Brevo / Resend / 로그)
 public/index.html   단일 페이지 (설정 → 로비 → 대화방)
 public/js/app.js    화면/채팅/통화 UI 로직
 public/js/rtc.js    WebRTC 1:1 음성 통화 (offer/answer/ICE)

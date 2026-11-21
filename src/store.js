@@ -13,7 +13,8 @@ const newKey = () => randomBytes(24).toString("base64url");
 // ---------------------------------------------------------------------------
 function memoryStore() {
   const settings = new Map();
-  const users = new Map(); // id -> {id, keyHash, name, lang, created}
+  const users = new Map(); // id -> {id, name, lang, created, email, googleSub}
+  const keys = new Map(); // key hash -> user id (one per signed-in device)
   const rooms = new Map(); // id -> {id, created, members: Map<userId, {lastRead}>}
   const messages = new Map(); // roomId -> msg[]
   const subs = new Map(); // endpoint -> {userId, sub}
@@ -29,15 +30,54 @@ function memoryStore() {
     async setSetting(k, v) {
       settings.set(k, v);
     },
-    async createUser({ name, lang }) {
+    async createUser({ name, lang, email = null, googleSub = null }) {
       const key = newKey();
-      const user = { id: randomUUID(), keyHash: hashKey(key), name, lang, created: Date.now() };
+      const user = { id: randomUUID(), name, lang, created: Date.now(), email, googleSub };
       users.set(user.id, user);
+      keys.set(hashKey(key), user.id);
       return { user: publicRecord(user), key };
     },
     async userByKey(key) {
-      const h = hashKey(key);
-      return publicRecord([...users.values()].find((u) => u.keyHash === h));
+      return publicRecord(users.get(keys.get(hashKey(key))));
+    },
+    async addKey(userId) {
+      const key = newKey();
+      keys.set(hashKey(key), userId);
+      return key;
+    },
+    async revokeKey(key) {
+      keys.delete(hashKey(key));
+    },
+    async userByEmail(email) {
+      return publicRecord([...users.values()].find((u) => u.email === email));
+    },
+    async userByGoogle(sub) {
+      return publicRecord([...users.values()].find((u) => u.googleSub === sub));
+    },
+    async accountOf(id) {
+      const u = users.get(id);
+      return u ? { email: u.email ?? null, google: Boolean(u.googleSub) } : null;
+    },
+    async setEmail(id, email) {
+      const u = users.get(id);
+      if (u) u.email = email;
+    },
+    async setGoogle(id, sub) {
+      const u = users.get(id);
+      if (u) u.googleSub = sub;
+    },
+    /** Move everything of `fromId` (rooms, messages, devices, push) to `toId`, then delete `fromId`. */
+    async mergeUsers(fromId, toId) {
+      for (const r of rooms.values()) {
+        const mine = r.members.get(fromId);
+        if (!mine) continue;
+        r.members.delete(fromId);
+        if (!r.members.has(toId)) r.members.set(toId, mine);
+      }
+      for (const list of messages.values()) for (const m of list) if (m.from === fromId) m.from = toId;
+      for (const s of subs.values()) if (s.userId === fromId) s.userId = toId;
+      for (const [h, uid] of keys) if (uid === fromId) keys.set(h, toId);
+      users.delete(fromId);
     },
     async getUser(id) {
       return publicRecord(users.get(id));
@@ -144,6 +184,12 @@ async function postgresStore(url) {
         CREATE INDEX IF NOT EXISTS messages_room_ts ON messages (room_id, ts);
         CREATE TABLE IF NOT EXISTS push_subs (
           endpoint TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, sub JSONB NOT NULL);
+        -- Accounts: a user can sign in with email and/or Google, from several devices (one key each).
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT UNIQUE;
+        CREATE TABLE IF NOT EXISTS user_keys (
+          key_hash TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, created BIGINT NOT NULL);
+        INSERT INTO user_keys (key_hash, user_id, created) SELECT key_hash, id, created FROM users ON CONFLICT DO NOTHING;
       `);
     },
     async getSetting(k) {
@@ -152,14 +198,70 @@ async function postgresStore(url) {
     async setSetting(k, v) {
       await q("INSERT INTO settings (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = $2", [k, v]);
     },
-    async createUser({ name, lang }) {
+    async createUser({ name, lang, email = null, googleSub = null }) {
       const key = newKey();
       const id = randomUUID();
-      await q("INSERT INTO users (id, key_hash, name, lang, created) VALUES ($1, $2, $3, $4, $5)", [id, hashKey(key), name, lang, Date.now()]);
+      const now = Date.now();
+      await q("INSERT INTO users (id, key_hash, name, lang, created, email, google_sub) VALUES ($1, $2, $3, $4, $5, $6, $7)", [
+        id,
+        hashKey(key),
+        name,
+        lang,
+        now,
+        email,
+        googleSub,
+      ]);
+      await q("INSERT INTO user_keys (key_hash, user_id, created) VALUES ($1, $2, $3)", [hashKey(key), id, now]);
       return { user: { id, name, lang }, key };
     },
     async userByKey(key) {
-      return (await q("SELECT id, name, lang FROM users WHERE key_hash = $1", [hashKey(key)])).rows[0] ?? null;
+      const r = await q("SELECT u.id, u.name, u.lang FROM user_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = $1", [hashKey(key)]);
+      return r.rows[0] ?? null;
+    },
+    async addKey(userId) {
+      const key = newKey();
+      await q("INSERT INTO user_keys (key_hash, user_id, created) VALUES ($1, $2, $3)", [hashKey(key), userId, Date.now()]);
+      return key;
+    },
+    async revokeKey(key) {
+      await q("DELETE FROM user_keys WHERE key_hash = $1", [hashKey(key)]);
+    },
+    async userByEmail(email) {
+      return (await q("SELECT id, name, lang FROM users WHERE email = $1", [email])).rows[0] ?? null;
+    },
+    async userByGoogle(sub) {
+      return (await q("SELECT id, name, lang FROM users WHERE google_sub = $1", [sub])).rows[0] ?? null;
+    },
+    async accountOf(id) {
+      const r = (await q("SELECT email, google_sub FROM users WHERE id = $1", [id])).rows[0];
+      return r ? { email: r.email ?? null, google: Boolean(r.google_sub) } : null;
+    },
+    async setEmail(id, email) {
+      await q("UPDATE users SET email = $2 WHERE id = $1", [id, email]);
+    },
+    async setGoogle(id, sub) {
+      await q("UPDATE users SET google_sub = $2 WHERE id = $1", [id, sub]);
+    },
+    async mergeUsers(fromId, toId) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          "DELETE FROM room_members WHERE user_id = $1 AND room_id IN (SELECT room_id FROM room_members WHERE user_id = $2)",
+          [fromId, toId],
+        );
+        await client.query("UPDATE room_members SET user_id = $2 WHERE user_id = $1", [fromId, toId]);
+        await client.query("UPDATE messages SET from_id = $2 WHERE from_id = $1", [fromId, toId]);
+        await client.query("UPDATE push_subs SET user_id = $2 WHERE user_id = $1", [fromId, toId]);
+        await client.query("UPDATE user_keys SET user_id = $2 WHERE user_id = $1", [fromId, toId]);
+        await client.query("DELETE FROM users WHERE id = $1", [fromId]);
+        await client.query("COMMIT");
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
     },
     async getUser(id) {
       return (await q("SELECT id, name, lang FROM users WHERE id = $1", [id])).rows[0] ?? null;

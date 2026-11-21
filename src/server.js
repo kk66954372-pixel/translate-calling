@@ -9,6 +9,7 @@ import { iceServers, turnInfo } from "./ice.js";
 import { openStream, sttInfo, sttEnabled } from "./stt.js";
 import { openStore } from "./store.js";
 import { initPush, pushTo, vapidPublicKey } from "./push.js";
+import { authInfo, googleClientId, startEmail, verifyEmail, verifyGoogle, createTicket, consumeTicket } from "./auth.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -34,8 +35,21 @@ app.get("/api/config", async (_req, res) => {
     translator: translatorInfo.mode,
     stt: sttEnabled ? sttInfo.mode : null,
     vapidPublicKey: vapidPublicKey(),
+    auth: authInfo,
+    googleClientId,
     iceServers: await iceServers(),
   });
+});
+
+// "Sign in with Google", redirect mode (used by the iPhone Home Screen app, where popups are unreliable):
+// Google posts the ID token here; we turn it into a one-time ticket the app redeems over the socket.
+app.post("/auth/google/callback", express.urlencoded({ extended: false, limit: "16kb" }), async (req, res) => {
+  const cookie = /(?:^|;\s*)g_csrf_token=([^;]+)/.exec(req.headers.cookie || "")?.[1];
+  if (!cookie || cookie !== req.body?.g_csrf_token) return res.redirect(303, "/?login=failed");
+  const g = await verifyGoogle(req.body?.credential);
+  if (!g.ok) return res.redirect(303, "/?login=failed");
+  const ticket = await createTicket(store, { sub: g.sub, email: g.email, name: g.name });
+  res.redirect(303, `/?gticket=${ticket}`);
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
@@ -274,6 +288,11 @@ io.on("connection", (socket) => {
 
   function attach(user) {
     const prev = sessions.get(socket.id);
+    if (prev && prev.userId !== user.id) {
+      // This socket signed in as someone else (e.g. logged into an account): leave the old identity.
+      online.get(prev.userId)?.delete(socket.id);
+      socket.leave(userRoom(prev.userId));
+    }
     sessions.set(socket.id, { userId: user.id, roomId: prev?.roomId ?? null, visible: prev?.visible ?? true });
     profiles.set(user.id, user);
     clearTimeout(offlineTimers.get(user.id));
@@ -307,10 +326,81 @@ io.on("connection", (socket) => {
         me: user,
         key: issuedKey,
         rooms: await Promise.all(rooms.map((r) => roomSummary(r, user.id))),
+        account: await store.accountOf(user.id),
         translator: translatorInfo.mode,
       });
       broadcastUsers();
       deliverPendingCalls(user.id, socket);
+    }),
+  );
+
+  // ---- Accounts: email code / Google ---------------------------------------------------------------
+  // Signing in finds the account for that email or Google identity. If this device was using an anonymous
+  // account, its rooms are merged into the signed-in account. With no account yet, the anonymous account
+  // gets the identity attached, or (on the setup screen) a new account is created.
+  async function signIn({ email = null, googleSub = null }, { name, lang } = {}) {
+    const current = uid();
+    let target = googleSub ? await store.userByGoogle(googleSub) : null;
+    if (!target && email) target = await store.userByEmail(email);
+
+    if (target) {
+      const acc = await store.accountOf(target.id);
+      if (googleSub && !acc.google) await store.setGoogle(target.id, googleSub);
+      if (email && !acc.email) await store.setEmail(target.id, email);
+      if (current && current !== target.id) {
+        const mine = await store.accountOf(current);
+        if (mine && !mine.email && !mine.google) {
+          await store.mergeUsers(current, target.id);
+          roomCache.clear();
+          profiles.delete(current);
+        }
+      }
+      return { ok: true, key: await store.addKey(target.id), switched: current !== target.id };
+    }
+
+    if (current) {
+      const mine = await store.accountOf(current);
+      if ((email && mine.email && mine.email !== email) || (googleSub && mine.google)) return { ok: false, error: "already_linked" };
+      if (email && !mine.email) await store.setEmail(current, email);
+      if (googleSub) await store.setGoogle(current, googleSub);
+      return { ok: true, linked: true, account: await store.accountOf(current) };
+    }
+
+    const nick = clean(name, 24);
+    if (!nick || !LANGS[lang]) return { ok: false, error: "need_profile" };
+    const { key } = await store.createUser({ name: nick, lang, email, googleSub });
+    return { ok: true, key, created: true };
+  }
+
+  const authLimiter = makeLimiter(10, 3600_000);
+  socket.on(
+    "auth:email:start",
+    safe(async ({ email } = {}, ack) => {
+      if (!authLimiter()) return ack?.({ ok: false, error: "too_many" });
+      ack?.(await startEmail(store, email));
+    }),
+  );
+  socket.on(
+    "auth:email:verify",
+    safe(async ({ email, code, name, lang } = {}, ack) => {
+      const v = await verifyEmail(store, email, code);
+      if (!v.ok) return ack?.(v);
+      ack?.(await signIn({ email: v.email }, { name, lang }));
+    }),
+  );
+  socket.on(
+    "auth:google",
+    safe(async ({ credential, ticket, name, lang } = {}, ack) => {
+      const g = ticket ? await consumeTicket(store, ticket) : await verifyGoogle(credential);
+      if (!g || g.ok === false) return ack?.({ ok: false, error: g?.error ?? "invalid_token" });
+      ack?.(await signIn({ googleSub: g.sub, email: g.email }, { name: name || g.name, lang }));
+    }),
+  );
+  socket.on(
+    "auth:logout",
+    safe(async ({ key } = {}, ack) => {
+      if (typeof key === "string" && key.length >= 16) await store.revokeKey(key);
+      ack?.({ ok: true });
     }),
   );
 
@@ -621,6 +711,7 @@ server.listen(PORT, () => {
   console.log(`Language exchange server on http://localhost:${PORT}`);
   console.log(`  translator: ${t}  ·  speech-to-text: ${s}  ·  ICE: ${turnInfo()}`);
   console.log(`  storage: ${store.kind === "postgres" ? "Postgres (DATABASE_URL)" : "memory — data is lost on restart (set DATABASE_URL)"}`);
+  console.log(`  sign-in: email ${authInfo.email ? "on" : "off (set BREVO_API_KEY + EMAIL_FROM)"}  ·  Google ${authInfo.google ? "on" : "off (set GOOGLE_CLIENT_ID)"}`);
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }

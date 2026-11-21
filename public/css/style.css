@@ -321,3 +321,23 @@ body.offline .topbar { box-shadow: inset 0 -3px 0 #f0a33a; }
 /* Home Screen app: respect the iPhone notch / home indicator */
 .topbar { padding-top: max(10px, env(safe-area-inset-top)); }
 .composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+
+/* Sign-in (Google / email code) */
+.login-block { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-top: 4px; }
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; margin: 18px 0 4px; }
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.g-btn { display: flex; justify-content: center; min-height: 0; }
+.g-btn:empty { display: none; }
+.email-box { display: flex; flex-direction: column; gap: 8px; }
+.email-box .row { display: flex; gap: 8px; }
+.email-box input {
+  flex: 1; min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg);
+  color: var(--text); font-size: 16px;
+}
+.email-box input.code { letter-spacing: 6px; text-align: center; font-size: 20px; }
+.email-box .hint { font-size: 13px; color: var(--muted); margin: 0; }
+.email-box .links { display: flex; gap: 14px; justify-content: center; font-size: 13px; }
+.email-box .links button { background: none; border: 0; color: var(--primary); cursor: pointer; padding: 4px; font: inherit; }
+.center { text-align: center; }
+.account-card { display: flex; flex-direction: column; gap: 8px; }
+.small-btn { align-self: flex-start; font-size: 13px; padding: 6px 12px; }
