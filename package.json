@@ -1,7 +1,7 @@
 {
-  "name": "koja-talk",
+  "name": "ondo",
   "version": "1.0.0",
-  "description": "Korean ↔ Japanese language exchange: real-time translated chat and calls",
+  "description": "Ondo (온도 · おんど): Korean ↔ Japanese translated chat and calls",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

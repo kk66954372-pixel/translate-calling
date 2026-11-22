@@ -623,7 +623,7 @@ $("#copy-btn").addEventListener("click", async () => {
 if (navigator.share) {
   $("#share-btn").hidden = false;
   $("#share-btn").addEventListener("click", () =>
-    navigator.share({ title: "KoJa Talk", text: T.shareText, url: $("#link-url").value }).catch(() => {}),
+    navigator.share({ title: "Ondo", text: T.shareText, url: $("#link-url").value }).catch(() => {}),
   );
 }
 

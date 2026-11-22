@@ -11,7 +11,7 @@ self.addEventListener("push", (e) => {
   }
   // iOS requires every push to show a notification, so always show one.
   e.waitUntil(
-    self.registration.showNotification(d.title || "KoJa Talk", {
+    self.registration.showNotification(d.title || "Ondo", {
       body: d.body || "",
       tag: d.tag,
       renotify: Boolean(d.tag),

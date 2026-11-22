@@ -60,8 +60,8 @@ app.get("/manifest.webmanifest", (req, res) => {
   const t = /^[\w-]{16,64}$/.test(String(req.query.t ?? "")) ? `?t=${req.query.t}` : "";
   res.type("application/manifest+json").send(
     JSON.stringify({
-      name: "KoJa Talk · 코자톡 · コジャトーク",
-      short_name: "KoJa Talk",
+      name: "Ondo · 온도 · おんど",
+      short_name: "Ondo",
       description: "한국어 ↔ 日本語 번역 채팅 & 통화",
       start_url: `/${t}`,
       scope: "/",
@@ -536,7 +536,7 @@ io.on("connection", (socket) => {
       const hostProfile = await getProfile(host);
       toUser(host).emit("room:joined-by", { roomId: room.id, user: publicUser(meProfile) });
       if (hostProfile && !isVisible(host)) {
-        pushTo(host, { kind: "joined", title: "KoJa Talk", body: PUSH_TEXT[hostProfile.lang].joined(meProfile.name), tag: `room-${room.id}`, url: `/?open=${room.id}` });
+        pushTo(host, { kind: "joined", title: "Ondo", body: PUSH_TEXT[hostProfile.lang].joined(meProfile.name), tag: `room-${room.id}`, url: `/?open=${room.id}` });
       }
       ack?.({ ok: true, roomId: room.id, waiting: false });
     }),

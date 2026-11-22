@@ -1,4 +1,6 @@
-# KoJa Talk · 코자톡 · コジャトーク
+# Ondo · 온도 · おんど
+
+> 이름의 뜻: 온도(溫度)와 温度(おんど)는 한국어·일본어에서 발음도 뜻도 같습니다. 대화의 온도, 따뜻하게 이어지는 인연.
 
 한국인과 일본인이 **전화로 언어교환**하는 웹앱입니다. 내가 한국어로 말하면 상대에게는 **내 목소리가 그대로 들리고**, 화면에는 **일본어 번역 자막**이 뜹니다. (반대도 마찬가지)
 
@@ -52,7 +54,7 @@ npm run dev:mock
 | `DATABASE_URL` | – | Postgres 연결 문자열 (예: Neon 무료). **배포 시 필수** — 없으면 계정·대화방·기록이 메모리에만 있어 서버가 재시작/잠들면 사라짐 |
 | `GOOGLE_CLIENT_ID` | – | "Google로 계속하기" 로그인용 OAuth 클라이언트 ID (Google Cloud 콘솔, 웹 애플리케이션) |
 | `BREVO_API_KEY` | – | 이메일 인증 코드 발송 (Brevo, 하루 300통 무료). Render 무료 플랜은 SMTP가 막혀 있어 HTTP API를 사용 |
-| `EMAIL_FROM` | – | 보내는 사람, 예: `KoJa Talk <me@gmail.com>` (Brevo에서 인증한 주소) |
+| `EMAIL_FROM` | – | 보내는 사람, 예: `Ondo <me@gmail.com>` (Brevo에서 인증한 주소) |
 | `RESEND_API_KEY` | – | Brevo 대신 Resend 사용 시 (본인 도메인 필요) |
 | `MAIL` | – | `log` 면 메일 대신 서버 로그에 코드 출력 (개발·테스트용) |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | 자동 생성 | 푸시 알림 서버 키. 비워 두면 처음 시작할 때 만들어 DB에 저장 |
