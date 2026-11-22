@@ -39,10 +39,13 @@ _마지막 업데이트: 2026-11-15_
 - [x] Deepgram API 키 → Render `DEEPGRAM_API_KEY` (무료 크레딧 $200, 자동 충전 꺼짐)
 - [x] Neon 데이터베이스 → Render `DATABASE_URL`
 - [x] Cloudflare TURN 키 → Render `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN`
-- [ ] **둘 다 아이폰에 앱 설치 + 알림 켜기**. Safari로 열기 → 공유 → 홈 화면에 추가 → 홈 화면 앱에서 6자리 코드로 이어서 쓰기 → 🔔 알림 켜기. 그다음 초대 링크를 새로 만들어 친구에게 보내기 (DB 전환으로 예전 계정은 초기화됨)
-- [ ] **실기기 테스트** (아래 표). 특히 5G끼리, 한국↔일본 통화
-- [ ] (권장) Cloudflare 결제 설정에서 사용량 알림 켜기
-- [ ] (권장) 서버 잠들지 않게 하기: cron-job.org 무료 가입 → `https://koja-talk.onrender.com/healthz` 를 10분마다 호출 (앱을 열 때 1분 기다리는 문제 해결)
+- [ ] **① Google 클라이언트 ID** → Render `GOOGLE_CLIENT_ID` (Google Cloud 콘솔, 무료, 동의 화면 "게시" 필수)
+- [ ] **② Brevo API 키 + 보내는 주소 인증** → Render `BREVO_API_KEY`, `EMAIL_FROM` (무료 하루 300통)
+- [ ] **③ 앱 설치 + 알림 켜기 + 친구와 실기기 테스트** (아래 표, 일본어 섞어 말하기 포함)
+- [ ] ④ (권장) 서버 잠들지 않게: cron-job.org → `/healthz` 10분마다
+- [ ] ⑤ (권장) Cloudflare 사용량 알림
+- [ ] ⑥ (결정 필요, 유료) **도메인 구매** (연 약 1.5~2만 원) → Render 연결, Brevo 도메인 인증(메일 스팸 방지), Google 승인 주소 추가. 사용자가 늘기 전에 하는 게 좋음
+- [ ] (결제 단계에서) 사업자등록·통신판매업 신고, 결제대행사(토스페이먼츠 등) 가입, 약관·개인정보처리방침
 
 ---
 
