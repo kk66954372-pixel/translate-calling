@@ -934,10 +934,20 @@ function applyTranslation({ id, text, ok, lang, error }) {
     r.subText.replaceChildren(`⚠️ ${why}`);
     return r;
   }
+  // The direction follows the language actually used (r.entry.lang = language of the original,
+  // lang = language of the translation), so someone may write in either language.
   if (r.mine) {
+    // Big: what I wrote. Small: what my partner reads, or (if I wrote in their language) its meaning in mine.
+    r.label.textContent = lang === state.me.lang ? T.meaning : T.theySee;
+    r.subText.replaceChildren(text);
+    r.sub.append(ttsButton(() => text, lang));
+  } else if (r.entry.lang === state.me.lang) {
+    // They wrote in my language: keep their own words big, the translation into their language small.
+    r.label.textContent = T.translationLabel;
     r.subText.replaceChildren(text);
     r.sub.append(ttsButton(() => text, lang));
   } else {
+    // Big: the translation into my language. Small: the original, with its pronunciation.
     r.main.textContent = text;
     r.subText.replaceChildren(original);
     r.sub.append(ttsButton(() => original, r.entry.lang));
@@ -1256,7 +1266,9 @@ socket.on("caption:translation", (t) => {
     if (t.id === lastMyCaptionId) showMyCaption(r.entry.text, t.text);
     return;
   }
-  setPartnerCaption(t.text, r.entry.text);
+  // Show the version in my language big, whichever language my partner spoke.
+  if (r.entry.lang === state.me.lang) setPartnerCaption(r.entry.text, t.text);
+  else setPartnerCaption(t.text, r.entry.text);
   clearTimeout(partnerCapTimer);
   partnerCapTimer = setTimeout(() => setPartnerCaption(""), 12000);
 });

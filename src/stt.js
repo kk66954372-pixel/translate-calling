@@ -16,6 +16,63 @@ const BYTES_PER_SECOND = SAMPLE_RATE * 2;
 const DAILY_MINUTES = Number(process.env.DAILY_STT_MINUTES ?? 600);
 
 export const sttInfo = { mode: MODE === "deepgram" && !KEY ? "off" : MODE, model: MODEL };
+
+// Recognise Korean and Japanese in the same stream, whichever someone speaks (a Korean speaker practising
+// Japanese, or the other way round). If Deepgram refuses the multilingual setup, fall back for good to
+// each speaker's own language. STT_LANGUAGES=native forces that.
+let multiRefused = process.env.STT_LANGUAGES === "native";
+export const speechLanguages = () => (multiRefused ? "native" : "ko+ja");
+
+function streamUrl(lang, multi) {
+  const params = new URLSearchParams({
+    model: MODEL,
+    language: multi ? "multi" : lang,
+    encoding: "linear16",
+    sample_rate: String(SAMPLE_RATE),
+    channels: "1",
+    interim_results: "true",
+    punctuate: "true",
+    endpointing: "400", // ms of silence that ends a sentence
+    utterance_end_ms: "1200", // backup end-of-sentence signal for noisy audio
+    vad_events: "true",
+  });
+  if (multi) {
+    params.append("language_hint", "ko");
+    params.append("language_hint", "ja");
+  } else {
+    params.set("smart_format", "true");
+  }
+  return `${process.env.DEEPGRAM_URL || "wss://api.deepgram.com/v1/listen"}?${params}`;
+}
+
+/** Check once at startup whether Deepgram accepts the multilingual stream (no audio, so nothing is billed). */
+export function probeSpeechLanguages() {
+  if (sttInfo.mode !== "deepgram" || multiRefused) return Promise.resolve(speechLanguages());
+  return new Promise((resolve) => {
+    const ws = new WebSocket(streamUrl("ko", true), { headers: { Authorization: `Token ${KEY}` } });
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.terminate();
+      } catch {}
+      resolve(result);
+    };
+    const timer = setTimeout(() => done("unknown (timeout)"), 8000);
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "CloseStream" }));
+      done(speechLanguages());
+    });
+    ws.on("unexpected-response", (req, res) => {
+      req.destroy();
+      if (res.statusCode === 400) multiRefused = true;
+      done(res.statusCode === 400 ? speechLanguages() : `unknown (HTTP ${res.statusCode})`);
+    });
+    ws.on("error", () => done("unknown (network)"));
+  });
+}
 export const sttEnabled = sttInfo.mode === "deepgram" || sttInfo.mode === "mock";
 
 const usage = { day: "", bytes: 0 };
@@ -55,51 +112,9 @@ class DeepgramStream {
     this.finals = []; // finished segments of the sentence being spoken
     this.lastAudio = Date.now();
     this.finalized = true; // no audio since the last Finalize
-    this.join = (parts) => {
-      const text = parts.join(" ").trim();
-      return h.lang === "ja" ? text.replace(CJK_GAP, "") : text;
-    };
-
-    const params = new URLSearchParams({
-      model: MODEL,
-      language: h.lang,
-      encoding: "linear16",
-      sample_rate: String(SAMPLE_RATE),
-      channels: "1",
-      interim_results: "true",
-      smart_format: "true",
-      punctuate: "true",
-      endpointing: "400", // ms of silence that ends a sentence
-      utterance_end_ms: "1200", // backup end-of-sentence signal for noisy audio
-      vad_events: "true",
-    });
-    this.ws = new WebSocket(`${process.env.DEEPGRAM_URL || "wss://api.deepgram.com/v1/listen"}?${params}`, {
-      headers: { Authorization: `Token ${KEY}` },
-    });
-    this.ws.on("open", () => {
-      for (const chunk of this.pending) this.ws.send(chunk);
-      this.pending = [];
-    });
-    this.ws.on("message", (data) => this.#onMessage(data));
-    this.ws.on("unexpected-response", (req, res) => {
-      req.destroy();
-      // 401: bad key, 402: out of credit, 400: unsupported model/language.
-      const code = res.statusCode === 402 ? "no_credit" : res.statusCode === 401 || res.statusCode === 403 ? "auth" : `http_${res.statusCode}`;
-      console.error(`[stt] Deepgram refused the stream: ${res.statusCode}`);
-      this.#fail(code);
-    });
-    this.ws.on("error", (e) => {
-      console.error("[stt] Deepgram socket error:", e.message);
-      this.#fail("network");
-    });
-    this.ws.on("close", (code, reason) => {
-      if (!this.closed && code !== 1000) {
-        console.error(`[stt] Deepgram closed the stream: ${code} ${reason}`);
-        this.#fail("closed");
-      }
-      this.closed = true;
-      clearInterval(this.keepAlive);
-    });
+    // Removes spaces only between Japanese characters, so it is safe for Korean (Hangul is not in CJK).
+    this.join = (parts) => parts.join(" ").trim().replace(CJK_GAP, "");
+    this.#connect(!multiRefused);
     this.lastKeepAlive = 0;
     this.keepAlive = setInterval(() => {
       if (this.ws.readyState !== WebSocket.OPEN) return;
@@ -116,6 +131,45 @@ class DeepgramStream {
         this.ws.send(JSON.stringify({ type: "KeepAlive" }));
       }
     }, 500);
+  }
+
+  #connect(multi) {
+    const ws = new WebSocket(streamUrl(this.h.lang, multi), { headers: { Authorization: `Token ${KEY}` } });
+    this.ws = ws;
+    const current = () => ws === this.ws; // ignore events from a socket we already replaced
+    ws.on("open", () => {
+      if (!current()) return;
+      for (const chunk of this.pending) ws.send(chunk);
+      this.pending = [];
+    });
+    ws.on("message", (data) => current() && this.#onMessage(data));
+    ws.on("unexpected-response", (req, res) => {
+      req.destroy();
+      if (!current()) return;
+      if (multi && res.statusCode === 400) {
+        multiRefused = true;
+        console.warn("[stt] Deepgram refused the Korean+Japanese stream (400); using each speaker's own language");
+        return this.#connect(false);
+      }
+      // 401: bad key, 402: out of credit, 400: unsupported model/language.
+      const code = res.statusCode === 402 ? "no_credit" : res.statusCode === 401 || res.statusCode === 403 ? "auth" : `http_${res.statusCode}`;
+      console.error(`[stt] Deepgram refused the stream: ${res.statusCode}`);
+      this.#fail(code);
+    });
+    ws.on("error", (e) => {
+      if (!current()) return;
+      console.error("[stt] Deepgram socket error:", e.message);
+      this.#fail("network");
+    });
+    ws.on("close", (code, reason) => {
+      if (!current()) return;
+      if (!this.closed && code !== 1000) {
+        console.error(`[stt] Deepgram closed the stream: ${code} ${reason}`);
+        this.#fail("closed");
+      }
+      this.closed = true;
+      clearInterval(this.keepAlive);
+    });
   }
 
   write(chunk) {

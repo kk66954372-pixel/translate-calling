@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import { translate, translatorInfo, LANGS } from "./translator.js";
 import { iceServers, turnInfo } from "./ice.js";
-import { openStream, sttInfo, sttEnabled } from "./stt.js";
+import { openStream, sttInfo, sttEnabled, probeSpeechLanguages } from "./stt.js";
 import { openStore } from "./store.js";
+import { detectLang, otherLang } from "./lang.js";
 import { initPush, pushTo, vapidPublicKey } from "./push.js";
 import { authInfo, googleClientId, startEmail, verifyEmail, verifyGoogle, createTicket, consumeTicket } from "./auth.js";
 
@@ -151,14 +152,21 @@ async function findOrCreatePairRoom(a, b) {
   return existing ?? createRoom([a, b]);
 }
 
+/** The version of a message a reader should see first: what they wrote, or the text in their language. */
+function textFor(msg, reader) {
+  if (msg.from === reader?.id || msg.lang === reader?.lang) return msg.text;
+  return msg.translation || msg.text;
+}
+
 async function roomSummary(room, uid) {
   const pid = partnerIdOf(room, uid);
   const partner = pid ? await getProfile(pid) : null;
+  const me = await getProfile(uid);
   const [last] = await store.recentMessages(room.id, 1);
   return {
     id: room.id,
     partner: partner ? { ...partner, ...presenceOf(pid) } : null,
-    last: last ? { text: last.from === uid ? last.text : last.translation || last.text, ts: last.ts, mine: last.from === uid, kind: last.kind } : null,
+    last: last ? { text: textFor(last, me ?? { id: uid }), ts: last.ts, mine: last.from === uid, kind: last.kind } : null,
     unread: await store.unread(room.id, uid),
   };
 }
@@ -238,22 +246,27 @@ async function postMessage(uid, roomId, text, kind) {
   if (!allow(uid)) return { ok: false, error: "rate_limited" };
 
   const context = (await store.recentMessages(room.id, 6)).map((m) => ({ speaker: m.name, text: m.text }));
-  const msg = { id: randomUUID(), roomId: room.id, from: uid, name: me.name, lang: me.lang, kind, text: body, ts: Date.now() };
+  // Translate by the language actually used, not the one picked at sign-up: a Korean speaker practising
+  // Japanese gets a Korean translation, and the other way round. `lang` is the language of the text.
+  const from = detectLang(body, me.lang);
+  const to = otherLang(from);
+  const msg = { id: randomUUID(), roomId: room.id, from: uid, name: me.name, lang: from, kind, text: body, ts: Date.now() };
   await store.addMessage(msg);
   toMembers(room).emit(kind === "chat" ? "chat:message" : "caption", msg);
   if (isViewing(pid, room.id)) await store.setLastRead(room.id, pid, msg.ts);
 
   (async () => {
-    const result = await translate(body, me.lang, partner.lang, context, { kind });
-    await store.updateMessage(room.id, msg.id, { translation: result.text, tlang: partner.lang, ok: result.ok, error: result.error });
-    toMembers(room).emit(kind === "chat" ? "chat:translation" : "caption:translation", { roomId: room.id, id: msg.id, lang: partner.lang, ...result });
+    const result = await translate(body, from, to, context, { kind });
+    await store.updateMessage(room.id, msg.id, { translation: result.text, tlang: to, ok: result.ok, error: result.error });
+    toMembers(room).emit(kind === "chat" ? "chat:translation" : "caption:translation", { roomId: room.id, id: msg.id, lang: to, ...result });
     if (kind !== "chat") return;
     await sendSummaries(room);
     if (!isViewing(pid, room.id)) {
       await pushTo(pid, {
         kind: "message",
         title: me.name,
-        body: result.ok && result.text ? `${result.text}\n${body}` : body,
+        // The partner's language first, the other underneath.
+        body: !(result.ok && result.text) ? body : to === partner.lang ? `${result.text}\n${body}` : `${body}\n${result.text}`,
         tag: `msg-${room.id}`,
         url: `/?open=${room.id}`,
       });
@@ -715,6 +728,8 @@ server.listen(PORT, () => {
   if (translatorInfo.mode !== "mock" && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     console.warn("⚠️  ANTHROPIC_API_KEY is not set — translations will fail. Set it, or run with TRANSLATOR=mock.");
   }
+  // Which languages call captions recognise: Korean+Japanese in one stream, or each speaker's own.
+  if (sttInfo.mode === "deepgram") probeSpeechLanguages().then((r) => console.log(`[stt] speech languages: ${r}`));
   // Fetch TURN credentials once at startup so a bad key shows up in the log right away.
   if (turnInfo() === "Cloudflare TURN") {
     iceServers().then((list) => {
