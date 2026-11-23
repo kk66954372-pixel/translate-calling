@@ -554,6 +554,7 @@ function renderRooms() {
       const li = document.createElement("li");
       li.className = "room-row";
       li.onclick = () => openRoom(r.id);
+      onLongPress(li, () => askHideRoom(r));
       const av = avatar(r.partner);
       if (r.partner.online) av.classList.add("online");
       const mid = document.createElement("div");
@@ -853,15 +854,59 @@ function setRoomEnabled(on) {
 
 $("#leave-btn").addEventListener("click", leaveRoomScreen);
 
-// ⋯ → hide this chat from my list (e.g. a second room with the same friend). The friend keeps it.
-$("#room-menu-btn").addEventListener("click", () => {
-  const room = currentRoom();
+// Hide a chat from my list (e.g. a second room with the same friend). The friend keeps it.
+// From ⋯ in the chat header, or by long-pressing the chat in the list.
+function askHideRoom(room) {
   if (!room?.partner) return;
   openModal("hide-room", T.hideRoomAsk(room.partner.name), [
     { label: T.cancel },
     { label: T.hideRoom, cls: "danger", onClick: () => socket.emit("room:hide", { roomId: room.id }, (res) => res?.ok && toast(T.roomHidden)) },
   ]);
+}
+$("#room-menu-btn").addEventListener("click", () => askHideRoom(currentRoom()));
+function onLongPress(el, fn) {
+  let timer = null;
+  let pressed = false;
+  const cancel = () => clearTimeout(timer);
+  el.addEventListener("touchstart", () => {
+    pressed = false;
+    cancel();
+    timer = setTimeout(() => ((pressed = true), navigator.vibrate?.(15), fn()), 550);
+  }, { passive: true });
+  for (const ev of ["touchend", "touchmove", "touchcancel"]) el.addEventListener(ev, cancel, { passive: true });
+  el.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (!pressed) fn();
+  });
+  // Swallow the tap that ends a long press.
+  el.addEventListener("click", (e) => {
+    if (pressed) {
+      pressed = false;
+      e.stopImmediatePropagation();
+    }
+  }, true);
+}
+
+// A new version was deployed while this app stayed open: reload when nothing would be interrupted.
+const BUILD = document.querySelector('meta[name="app-version"]')?.content;
+let updateReady = false;
+function reloadIfIdle() {
+  if (!updateReady) return;
+  const busy = (call && call.state !== "idle") || state.modal || $("#msg-input").value.trim() || document.activeElement?.tagName === "INPUT";
+  if (busy) return;
+  try {
+    if (sessionStorage.getItem("koja.reloadedFor") === updateReady) return; // never loop
+    sessionStorage.setItem("koja.reloadedFor", updateReady);
+  } catch {}
+  location.replace(state.roomId ? `/?open=${state.roomId}` : location.href);
+}
+socket.on("server:version", (v) => {
+  if (!BUILD || !v || v === BUILD) return;
+  updateReady = v;
+  reloadIfIdle();
 });
+setInterval(reloadIfIdle, 10_000);
+document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && reloadIfIdle());
 socket.on("room:hidden", ({ roomId }) => {
   state.rooms.delete(roomId);
   if (state.roomId === roomId) leaveRoomScreen();

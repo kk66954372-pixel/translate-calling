@@ -1,6 +1,7 @@
 import express from "express";
 import http from "node:http";
 import path from "node:path";
+import fs from "node:fs";
 import { randomUUID, randomInt, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
@@ -44,7 +45,17 @@ app.get("/sw.js", (_req, res, next) => {
   res.set("Cache-Control", "no-cache");
   next();
 });
-app.use(express.static(path.join(here, "..", "public")));
+// The page carries the build it belongs to, so an installed app that stayed open across a deploy can tell
+// it is out of date (iOS keeps Home Screen apps alive in memory) and reload itself.
+const BUILD = (process.env.RENDER_GIT_COMMIT || "").slice(0, 12) || `dev-${Date.now().toString(36)}`;
+const INDEX_HTML = fs
+  .readFileSync(path.join(here, "..", "public", "index.html"), "utf8")
+  .replace("<head>", `<head>\n  <meta name="app-version" content="${BUILD}">`);
+app.get(["/", "/index.html"], (_req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.type("html").send(INDEX_HTML);
+});
+app.use(express.static(path.join(here, "..", "public"), { setHeaders: (res) => res.set("Cache-Control", "no-cache") }));
 
 app.get("/api/config", async (_req, res) => {
   res.json({
@@ -305,6 +316,7 @@ app.get("/api/link/:code", async (req, res) => {
 });
 
 io.on("connection", (socket) => {
+  socket.emit("server:version", BUILD);
   const uid = () => sessions.get(socket.id)?.userId ?? null;
   const safe = (fn) => async (...args) => {
     try {

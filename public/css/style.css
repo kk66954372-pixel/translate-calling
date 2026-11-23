@@ -361,3 +361,4 @@ body.room-open { overflow: hidden; overscroll-behavior: none; }
 .room-bar .partner { justify-content: flex-start; }
 .room-bar .partner-text .status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 480px) { .room-bar .lang-badge { display: none; } }
+.room-row { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
