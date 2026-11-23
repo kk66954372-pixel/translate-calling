@@ -853,6 +853,21 @@ function setRoomEnabled(on) {
 
 $("#leave-btn").addEventListener("click", leaveRoomScreen);
 
+// ⋯ → hide this chat from my list (e.g. a second room with the same friend). The friend keeps it.
+$("#room-menu-btn").addEventListener("click", () => {
+  const room = currentRoom();
+  if (!room?.partner) return;
+  openModal("hide-room", T.hideRoomAsk(room.partner.name), [
+    { label: T.cancel },
+    { label: T.hideRoom, cls: "danger", onClick: () => socket.emit("room:hide", { roomId: room.id }, (res) => res?.ok && toast(T.roomHidden)) },
+  ]);
+});
+socket.on("room:hidden", ({ roomId }) => {
+  state.rooms.delete(roomId);
+  if (state.roomId === roomId) leaveRoomScreen();
+  else renderRooms();
+});
+
 function systemMessage(text) {
   const li = document.createElement("li");
   li.className = "msg system";

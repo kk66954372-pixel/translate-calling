@@ -351,3 +351,13 @@ body.kb-open .stage { height: auto; min-height: 0; max-height: 40%; padding-top:
 body.kb-open .stage .call-head,
 body.kb-open .stage .cap-block.me { display: none; }
 body.room-open { overflow: hidden; overscroll-behavior: none; }
+
+/* ⋯ menu in the chat header */
+.room-menu-btn { padding: 6px 10px; font-size: 20px; line-height: 1; margin-left: -6px; }
+#modal-text { white-space: pre-line; }
+.room-bar { gap: 8px; padding-left: 10px; padding-right: 10px; }
+.room-bar #leave-btn { padding: 8px 10px; flex: none; }
+.room-bar .call-btn { flex: none; white-space: nowrap; }
+.room-bar .partner { justify-content: flex-start; }
+.room-bar .partner-text .status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 480px) { .room-bar .lang-badge { display: none; } }

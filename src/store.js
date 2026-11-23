@@ -99,7 +99,18 @@ function memoryStore() {
       rooms.get(id)?.members.set(userId, { lastRead: Date.now() });
     },
     async roomsOf(userId) {
-      return [...rooms.values()].filter((r) => r.members.has(userId)).map(roomView);
+      return [...rooms.values()].filter((r) => r.members.has(userId)).map((r) => ({ ...roomView(r), hidden: Boolean(r.members.get(userId).hidden) }));
+    },
+    /** Hide a room from one member's list (or show it again). */
+    async setHidden(roomId, userId, hidden) {
+      const m = rooms.get(roomId)?.members.get(userId);
+      if (m) m.hidden = hidden;
+    },
+    /** Show the room again to everyone who hid it; returns whether anyone had. */
+    async unhideRoom(roomId) {
+      let any = false;
+      for (const m of rooms.get(roomId)?.members.values() ?? []) if (m.hidden) (m.hidden = false), (any = true);
+      return any;
     },
     /** Groups of rooms shared by the same two people, oldest first (duplicates to merge). */
     async duplicateRoomGroups() {
@@ -208,6 +219,8 @@ async function postgresStore(url) {
         CREATE TABLE IF NOT EXISTS user_keys (
           key_hash TEXT PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, created BIGINT NOT NULL);
         INSERT INTO user_keys (key_hash, user_id, created) SELECT key_hash, id, created FROM users ON CONFLICT DO NOTHING;
+        -- A member can hide a room from their list; a new message shows it again.
+        ALTER TABLE room_members ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false;
       `);
     },
     async getSetting(k) {
@@ -306,13 +319,19 @@ async function postgresStore(url) {
     async roomsOf(userId) {
       const rows = (
         await q(
-          `SELECT r.id, r.created, array_agg(m2.user_id) AS members
+          `SELECT r.id, r.created, array_agg(m2.user_id) AS members, bool_and(m.hidden) AS hidden
              FROM room_members m JOIN rooms r ON r.id = m.room_id JOIN room_members m2 ON m2.room_id = r.id
             WHERE m.user_id = $1 GROUP BY r.id, r.created`,
           [userId],
         )
       ).rows;
-      return rows.map((r) => ({ id: r.id, created: Number(r.created), members: r.members }));
+      return rows.map((r) => ({ id: r.id, created: Number(r.created), members: r.members, hidden: Boolean(r.hidden) }));
+    },
+    async setHidden(roomId, userId, hidden) {
+      await q("UPDATE room_members SET hidden = $3 WHERE room_id = $1 AND user_id = $2", [roomId, userId, hidden]);
+    },
+    async unhideRoom(roomId) {
+      return (await q("UPDATE room_members SET hidden = false WHERE room_id = $1 AND hidden", [roomId])).rowCount > 0;
     },
     async duplicateRoomGroups() {
       const r = await q(`

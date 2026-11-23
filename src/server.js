@@ -28,6 +28,7 @@ async function mergeDuplicateRooms() {
       roomCache.delete(id);
       merged++;
     }
+    await store.unhideRoom(keep); // one of the two may have been visible
   }
   if (merged) console.log(`[rooms] merged ${merged} duplicate room(s)`);
   return merged;
@@ -163,6 +164,7 @@ async function createRoom(memberIds, code = null) {
 
 async function findOrCreatePairRoom(a, b) {
   const existing = (await store.roomsOf(a)).find((r) => r.members.length === 2 && r.members.includes(b));
+  if (existing) await store.unhideRoom(existing.id);
   return existing ?? createRoom([a, b]);
 }
 
@@ -266,6 +268,7 @@ async function postMessage(uid, roomId, text, kind) {
   const to = otherLang(from);
   const msg = { id: randomUUID(), roomId: room.id, from: uid, name: me.name, lang: from, kind, text: body, ts: Date.now() };
   await store.addMessage(msg);
+  if (await store.unhideRoom(room.id)) await sendSummaries(room); // someone had hidden it: back in their list
   toMembers(room).emit(kind === "chat" ? "chat:message" : "caption", msg);
   if (isViewing(pid, room.id)) await store.setLastRead(room.id, pid, msg.ts);
 
@@ -347,7 +350,7 @@ io.on("connection", (socket) => {
         user = { ...user, name: nick, lang };
       }
       attach(user);
-      const rooms = await store.roomsOf(user.id);
+      const rooms = (await store.roomsOf(user.id)).filter((r) => !r.hidden);
       ack?.({
         ok: true,
         me: user,
@@ -509,6 +512,20 @@ io.on("connection", (socket) => {
     }),
   );
 
+  // Hide a chat from my list (all my devices). The friend keeps it; a new message brings it back.
+  socket.on(
+    "room:hide",
+    safe(async ({ roomId } = {}, ack) => {
+      const me = uid();
+      const room = await memberRoom(me, roomId);
+      if (!room || room.members.length < 2) return ack?.({ ok: false });
+      await store.setHidden(room.id, me, true);
+      await store.setLastRead(room.id, me, Date.now());
+      toUser(me).emit("room:hidden", { roomId: room.id });
+      ack?.({ ok: true });
+    }),
+  );
+
   // A new room link (one per friend). Reuses my room that is still waiting for someone, if any.
   socket.on(
     "link:create",
@@ -546,7 +563,13 @@ io.on("connection", (socket) => {
       // Already have a room with this person (e.g. they sent a new invite link): open that one instead of
       // making a second room. The new link stays free for someone else.
       const existing = (await store.roomsOf(me)).find((r) => r.members.length === 2 && r.members.includes(room.members[0]));
-      if (existing) return ack?.({ ok: true, roomId: existing.id, waiting: false, existing: true });
+      if (existing) {
+        if (existing.hidden) {
+          await store.setHidden(existing.id, me, false);
+          toUser(me).emit("room:summary", await roomSummary(existing, me));
+        }
+        return ack?.({ ok: true, roomId: existing.id, waiting: false, existing: true });
+      }
       await store.addMember(room.id, me);
       room.members.push(me);
       await sendSummaries(room);
