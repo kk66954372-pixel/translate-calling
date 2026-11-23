@@ -59,6 +59,7 @@ if ([...params.keys()].length) history.replaceState(null, "", location.pathname)
 // ---------------------------------------------------------------------------
 function show(screen) {
   document.querySelectorAll(".screen").forEach((s) => s.classList.toggle("active", s.id === `screen-${screen}`));
+  document.body.classList.toggle("room-open", screen === "room");
 }
 
 function applyI18n() {
@@ -1290,6 +1291,34 @@ $("#mic-btn").addEventListener("click", () => {
     showMyCaption("");
   }
 });
+
+// iPhone keyboard: keep the room fitted to the visible area above the keyboard, and show the latest message
+// when the keyboard opens. (Safari slides the page up under the keyboard instead of shrinking it.)
+(() => {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const root = document.documentElement;
+  const typing = () => /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName ?? "");
+  let full = vv.height; // visible height without the keyboard
+  let wasOpen = false;
+  const fit = () => {
+    if (!typing()) full = vv.height;
+    root.style.setProperty("--vv-h", `${Math.round(vv.height)}px`);
+    root.style.setProperty("--vv-top", `${Math.round(vv.offsetTop)}px`);
+    const open = typing() && vv.height < full * 0.8;
+    document.body.classList.toggle("kb-open", open);
+    if (open && !wasOpen && state.roomId) {
+      const list = $("#messages");
+      requestAnimationFrame(() => (list.scrollTop = list.scrollHeight));
+    }
+    wasOpen = open;
+  };
+  vv.addEventListener("resize", fit);
+  vv.addEventListener("scroll", fit);
+  window.addEventListener("orientationchange", () => setTimeout(() => ((full = vv.height), fit()), 300));
+  document.addEventListener("focusout", () => setTimeout(fit, 50));
+  fit();
+})();
 
 // Hooks for automated tests and debugging.
 window.__koja = {

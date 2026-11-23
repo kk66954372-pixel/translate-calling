@@ -101,6 +101,24 @@ function memoryStore() {
     async roomsOf(userId) {
       return [...rooms.values()].filter((r) => r.members.has(userId)).map(roomView);
     },
+    /** Groups of rooms shared by the same two people, oldest first (duplicates to merge). */
+    async duplicateRoomGroups() {
+      const byPair = new Map();
+      for (const r of [...rooms.values()].sort((x, y) => x.created - y.created)) {
+        if (r.members.size !== 2) continue;
+        const pair = [...r.members.keys()].sort().join(",");
+        byPair.set(pair, [...(byPair.get(pair) ?? []), r.id]);
+      }
+      return [...byPair.values()].filter((ids) => ids.length > 1);
+    },
+    /** Move all messages of room `fromId` into `toId` and delete `fromId`. */
+    async mergeRoom(fromId, toId) {
+      const moved = (messages.get(fromId) ?? []).map((m) => ({ ...m, roomId: toId }));
+      const list = [...(messages.get(toId) ?? []), ...moved].sort((x, y) => x.ts - y.ts);
+      messages.set(toId, list.slice(-MESSAGE_KEEP));
+      messages.delete(fromId);
+      rooms.delete(fromId);
+    },
     async addMessage(m) {
       const list = messages.get(m.roomId) ?? [];
       list.push({ ...m });
@@ -295,6 +313,29 @@ async function postgresStore(url) {
         )
       ).rows;
       return rows.map((r) => ({ id: r.id, created: Number(r.created), members: r.members }));
+    },
+    async duplicateRoomGroups() {
+      const r = await q(`
+        SELECT array_agg(id ORDER BY created) AS ids FROM (
+          SELECT r.id, r.created, string_agg(m.user_id::text, ',' ORDER BY m.user_id) AS pair
+            FROM rooms r JOIN room_members m ON m.room_id = r.id
+           GROUP BY r.id, r.created HAVING count(*) = 2
+        ) t GROUP BY pair HAVING count(*) > 1`);
+      return r.rows.map((x) => x.ids);
+    },
+    async mergeRoom(fromId, toId) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("UPDATE messages SET room_id = $2 WHERE room_id = $1", [fromId, toId]);
+        await client.query("DELETE FROM rooms WHERE id = $1", [fromId]);
+        await client.query("COMMIT");
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
     },
     async addMessage(m) {
       await q(

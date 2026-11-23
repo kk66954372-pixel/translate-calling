@@ -18,6 +18,20 @@ const RING_MS = 45_000; // how long a call rings (incl. waiting for a friend to 
 const OFFLINE_DEBOUNCE_MS = 5_000; // short network blips don't flip someone to "offline"
 
 const store = await openStore();
+
+/** Two people should have one room. Merge any extra rooms (messages kept) into the oldest one. */
+async function mergeDuplicateRooms() {
+  let merged = 0;
+  for (const [keep, ...extra] of await store.duplicateRoomGroups()) {
+    for (const id of extra) {
+      await store.mergeRoom(id, keep);
+      roomCache.delete(id);
+      merged++;
+    }
+  }
+  if (merged) console.log(`[rooms] merged ${merged} duplicate room(s)`);
+  return merged;
+}
 await initPush(store);
 
 const app = express();
@@ -366,6 +380,7 @@ io.on("connection", (socket) => {
           await store.mergeUsers(current, target.id);
           roomCache.clear();
           profiles.delete(current);
+          await mergeDuplicateRooms(); // both accounts may have had a room with the same friend
         }
       }
       return { ok: true, key: await store.addKey(target.id), switched: current !== target.id };
@@ -528,6 +543,10 @@ io.on("connection", (socket) => {
       }
       if (room.members.includes(me)) return ack?.({ ok: true, roomId: room.id, waiting: room.members.length < 2 });
       if (room.members.length >= 2) return ack?.({ ok: false, error: "full" });
+      // Already have a room with this person (e.g. they sent a new invite link): open that one instead of
+      // making a second room. The new link stays free for someone else.
+      const existing = (await store.roomsOf(me)).find((r) => r.members.length === 2 && r.members.includes(room.members[0]));
+      if (existing) return ack?.({ ok: true, roomId: existing.id, waiting: false, existing: true });
       await store.addMember(room.id, me);
       room.members.push(me);
       await sendSummaries(room);
@@ -719,6 +738,7 @@ io.on("connection", (socket) => {
 });
 
 server.listen(PORT, () => {
+  mergeDuplicateRooms().catch((e) => console.error("[rooms] duplicate check failed:", e.message));
   const t = translatorInfo.mode === "mock" ? "mock (no API calls)" : `Claude (${translatorInfo.model})`;
   const s = sttEnabled ? `${sttInfo.mode}${sttInfo.mode === "deepgram" ? ` (${sttInfo.model})` : ""}` : "browser only (set DEEPGRAM_API_KEY for phones)";
   console.log(`Language exchange server on http://localhost:${PORT}`);
